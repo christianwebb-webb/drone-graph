@@ -323,6 +323,13 @@ class Retriever:
         # reads its own database name from the environment.
         os.environ.setdefault("DB_NAME", config.DB_NAME)
         os.environ.setdefault("db_name", config.DB_NAME)
+        # `unified` is the one scope that does not receive the key through the
+        # service. It asks the retriever object for a `chat_api_key` attribute,
+        # UnifiedRetriever keeps its constructor arguments in a kwargs dict rather
+        # than as attributes, so the lookup misses and falls through to the
+        # environment. Without this the retrieval succeeds and only the answer
+        # fails, as "response generation failed".
+        os.environ["CHAT_API_KEY"] = config.openai_key()
         try:
             import retrievers.global_retriever_ng.global_retriever_ng as global_ng
             import retrievers.local_retriever.local_retriever as local

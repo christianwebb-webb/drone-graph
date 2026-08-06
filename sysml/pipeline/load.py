@@ -7,11 +7,16 @@ It is the same class the platform's importer pods run, given three things a pod
 gets from its surroundings instead: a database JWT (ArangoDB issues one at
 /_open/auth), a no-op progress sink, and a local URL.
 
-The one thing added afterwards is a label. The importer records which file a
-Document came from and connects Entity -> Chunk -> Document, so "which model is
-this entity in" is already answerable by walking two hops -- but every analytical
-question would have to walk them. `label` resolves the walk once and writes the
-answer onto the rows, so a question about one model is a filter.
+Two things are added afterwards, both before the vector indexes are built --
+creating an entity is impossible once the index exists.
+
+`label` writes down which file and model each row came from. The importer already
+connects Entity -> Chunk -> Document, so that is answerable by walking two hops;
+resolving the walk once means an analytical question is a filter instead.
+
+`structure` reads the sources again with a lexer, for the two things extraction is
+not reliable about: attribute values, and the containment and typing the syntax
+states outright.
 
     python -m sysml.pipeline.load
 """
@@ -24,6 +29,7 @@ import logging
 import sys
 
 from .. import config
+from . import structure
 
 
 def importer():
@@ -106,6 +112,12 @@ async def load() -> dict:
     await imp.import_relationships(config.ARTIFACTS.RELATIONSHIPS)
     await imp.import_community_reports(config.ARTIFACTS.COMMUNITY_REPORTS)
 
+    label(db)
+    # Before the indexes, not after: `structure` creates an entity for anything a
+    # file declares that the extraction did not report, and ArangoDB rejects a
+    # document with no value in an indexed vector field.
+    counts = structure.apply(db)
+
     # Not the edge collection. ArangoDB requires the indexed vector field on every
     # document in the collection, and only RELATED_TO edges carry one -- the
     # structural edges have no text to embed. Exact COSINE_SIMILARITY is used for
@@ -115,8 +127,10 @@ async def load() -> dict:
         await imp.create_vector_index(collection_name=name,
                                       field=config.EMBEDDING_FIELD,
                                       index_name=config.VECTOR_INDEX)
-    label(db)
-    return {name: db.collection(name).count() for name in config.ALL_COLLECTIONS}
+    return {**{name: db.collection(name).count() for name in config.ALL_COLLECTIONS},
+            "stated relations": counts["edges"],
+            "entities created by structure": counts["created"],
+            "short-name duplicates merged": counts["merged"]}
 
 
 def chunk_vectors(db, imp) -> int:

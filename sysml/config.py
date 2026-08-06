@@ -152,10 +152,41 @@ RELATIONSHIP_TYPES = [r.lower() for r in RELATIONS_ONTOLOGY]
 # ------------------------------------------------------------------ connections
 
 
+def _env_file() -> dict[str, str]:
+    """The `env` file sitting next to the cloned repos, parsed as KEY=VALUE lines.
+
+    Nothing here is exported wholesale -- the file also carries a deployment
+    password, and the only value wanted is the OpenAI key.
+    """
+    for name in ("env", ".env"):
+        path = ROOT.parent / name
+        if path.is_file():
+            break
+    else:
+        return {}
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        values[name.strip()] = value.strip().strip("\"'")
+    return values
+
+
 def openai_key() -> str:
-    key = os.environ.get("CHAT_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    from_file = _env_file()
+    key = (
+        from_file.get("CHAT_API_KEY")
+        or from_file.get("OPENAI_API_KEY")
+        or os.environ.get("CHAT_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
     if not key:
-        raise RuntimeError("set CHAT_API_KEY (or OPENAI_API_KEY) to an OpenAI key")
+        raise RuntimeError(
+            "no OpenAI key: put CHAT_API_KEY (or OPENAI_API_KEY) in the `env` file "
+            "beside the cloned repos, or export it"
+        )
     # The extraction half builds its own `AsyncOpenAI()` with no arguments, which
     # reads OPENAI_API_KEY and nothing else.
     os.environ["OPENAI_API_KEY"] = key

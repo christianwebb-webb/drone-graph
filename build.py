@@ -1,4 +1,4 @@
-"""Run the whole pipeline: extract -> load -> analogy.
+"""Run the whole pipeline: extract -> load (+ structure) -> analogy.
 
     python build.py            # everything
     python build.py --reset    # drop the database first
@@ -9,8 +9,15 @@ Needs a local ArangoDB with the experimental vector index enabled:
       -e ARANGO_ROOT_PASSWORD=testpass arangodb:3.12.9.4 \
       arangod --experimental-vector-index=true
 
-and CHAT_API_KEY set to an OpenAI key. Extraction caches every LLM answer in
+and an OpenAI key as CHAT_API_KEY in the `env` file one directory up (an exported
+CHAT_API_KEY / OPENAI_API_KEY also works). Extraction caches every LLM answer in
 out/kg, so a re-run over unchanged sources costs nothing.
+
+The graph is built from the sources twice, deliberately. `extract` asks an LLM
+what the text means; `structure`, inside `load`, reads the same files with a lexer
+for what the syntax states outright -- attribute values, containment and typing.
+The second pass is what makes a question like "sum the dry mass of the Saturn V"
+answerable, because that needs exact numbers on an exact tree.
 """
 
 from __future__ import annotations

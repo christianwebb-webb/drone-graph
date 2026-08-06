@@ -1,24 +1,43 @@
 # drone-graph
 
 Three SysML v2 models turned into an ArangoDB graph you can ask questions about in
-English. The graph is built by graphrag_importer's own extraction pipeline -- the
-same code the platform's importer pods run -- called in-process against a local
-container.
+English.
+
+The sources are read twice. graphrag_importer's own extraction pipeline -- the same
+code the platform's importer pods run, called in-process against a local container
+-- asks an LLM what the text means. A small lexer then reads the same files for
+what the syntax states outright: attribute values, containment and typing. The
+first pass is good at prose and hopeless at arithmetic; the second is the reverse.
 
 ```bash
 docker run -d --name christian-webb-drone-arango -p 8529:8529 \
   -e ARANGO_ROOT_PASSWORD=testpass arangodb:3.12.9.4 \
   arangod --experimental-vector-index=true
 
-export CHAT_API_KEY=sk-...      # OpenAI
 python build.py                 # extract -> load -> analogy
 ```
 
-Then open `extraction-demo.ipynb`, which is about how the graph is built and what
-that choice costs; `simple-demo.ipynb`, which asks it questions; and
-`analogy-demo.ipynb`, which is about relating the models to each other.
+The OpenAI key is read from `CHAT_API_KEY` (or `OPENAI_API_KEY`) in the `env` file
+one directory up, beside the cloned repos; an exported variable of either name is
+used when the file has neither.
+
+Four notebooks:
+
+- `nl-demo.ipynb` -- the two ways of asking, side by side. AQLizer for anything with
+  a shape (count, rollup, ranking, what is *missing*), GraphRAG for anything without
+  one. Ends on a question asked both ways, to show where the line falls.
+- `extraction-demo.ipynb` -- how the graph is built, and what the change to LLM
+  extraction cost and bought.
+- `analytics-demo.ipynb` -- the quantitative half: rollups, values, gaps, and the
+  lexer run live on a SysML file it has never seen.
+- `analogy-demo.ipynb` -- relating the two models to each other.
 
 You must have the 4 requisite Arango repos cloned adjacent to this one.
+
+## Brainstorming Questions
+
+- Since we need to send aql_examples, could we instead have this be generated on each import as part of the pipeline, then use a stronger model with a template of what this should look like to build a relevant aql_examples for each new import?
+- Currently, we just import all models in models/. If this project ever becomes more than a POC, we should change this.
 
 ## The pipeline
 
@@ -41,10 +60,12 @@ rationale too, and it is not specific to one input language. The two lists in
 it about SysML; `enable_strict_types=True` makes them closed, so an entity or edge
 typed outside them is dropped rather than renamed.
 
-**Cost:** the LLM writes the descriptions, so numbers live in prose rather than in a
-typed field, entity names come back upper-cased, and there are no line numbers --
-an entity traces to the files it appears in, not to a declaration. Every LLM answer
-is cached in `out/kg`, so a second run over unchanged sources is free.
+**Cost:** entity names come back upper-cased, and the LLM is unreliable about
+anything the syntax states mechanically -- on this corpus it produced 68 `owns`
+edges where the files state about seventeen hundred, found 99 of the 266 `satisfy`
+statements written down, and left `S-IC` with no relations at all. That is what
+`structure` exists to fix. Every LLM answer is cached in `out/kg`, so a second run
+over unchanged sources is free.
 
 ### 2. load -- `sysml/pipeline/load.py`
 
@@ -60,7 +81,64 @@ reading a hand-made copy of it that this project had to keep in step by hand.
 Afterwards it writes `files` and `models` onto every Document, Chunk and Entity. The
 importer already connects Entity -> Chunk -> Document, so "which model is this in"
 is answerable by walking two hops; resolving the walk once means an analytical
-question is a filter instead.
+question is a filter instead. Then it runs `structure`, below.
+
+### 2a. structure -- `sysml/pipeline/structure.py`
+
+Reads every `.sysml` file again with a lexer and writes down only what the syntax
+says outright: an `attributes` map of `{value, unit}` or `{expression}` on the
+element that declares it, its `short_name`, `source_file` / `source_line`, and the
+`owns`, `typedby`, `specializes`, `redefines` and `satisfies` edges. Elements a
+file declares that the extraction did not report are created, so the containment
+tree has no holes.
+
+**Why:** the numbers and the tree have to be exact, and an LLM is not. Without this,
+"sum the dry mass of the Saturn V from its stages" returns nothing -- not because
+the masses are missing but because there is no path from the vehicle to its stages
+to walk. With it the answer is 199,130 kg from seven contributors, and the four
+`...Cost` attributes on the mission add to $11bn.
+
+It knows SysML v2's declaration grammar, not this corpus: any modifier or `#`
+metadata annotation, a keyword in `KEYWORDS`, optionally `case` and `def`, an
+optional `<shortName>`, a name, then any combination of `:`, `:>`, `:>>` and `=`.
+A body can continue its enclosing declaration with a bare `:>` or `:>>`, and
+`satisfy REQ by DESIGN` is read as the relation it states. A model it has never
+seen parses on the same rules -- `analytics-demo.ipynb` runs it on one to show
+that, using forms no file here contains.
+
+`KEYWORDS` is the same 27-kind vocabulary the extraction step is given, so the two
+passes cannot disagree about what an element is. It is not derived from these
+files: eleven of the 27 never appear in them. SysML v2 does have declaration kinds
+outside that list -- `message`, `succession`, `alias` -- and those are left to
+extraction, along with the relationship statements that are not `satisfy`
+(`perform`, `connect`, `subject`, `import`, and the `#refinement dependency` form,
+whose meaning is carried by an annotation rather than by a keyword). What it also
+deliberately does not do is resolve names across files, infer anything, or read a
+`doc` comment; that is extraction's half, and it is better at it.
+
+Reading the short name is also what lets it clean up after extraction. A SysML
+element has two written names -- `requirement def <'DE-REQ-1'> Power` is addressed
+as either -- and extraction keeps whichever the sentence it read happened to use,
+so the same requirement arrives twice, once as `POWER` and once as `DE-REQ-1`,
+each with a share of the edges. Only the declaration says they are one element, so
+only this step can: 171 duplicate rows are folded into the element they name, and
+their edges moved across. A row is only a duplicate if no declaration resolves to
+it -- Apollo's `requirement 'flr-R001' : PropellantLoadingRequirement` is a real
+usage whose name happens to be another element's short name, and it survives.
+
+The same reasoning applies to the edges. Where extraction guessed a relation the
+syntax also states, the guess is dropped and the read one kept -- it carries the
+file and line. So is any edge from an element to itself: 12 of those were
+`satisfies`, enough to report twelve requirements as met by themselves and leave
+them out of the list of what nothing satisfies.
+
+Edges it writes are `RELATED_TO` with the relation in `relationship_type`, the same
+shape extraction writes, so nothing downstream has to know which pass produced an
+edge. `stated: true` marks the ones that came from here, for when you do want to
+tell them apart.
+
+It runs inside `load` rather than as a step of its own because creating an entity
+is impossible once the Entities vector index exists.
 
 ### 3. analogy -- `sysml/pipeline/analogy.py`
 
@@ -84,7 +162,16 @@ same word, and "what plays the drone battery's role in Apollo?" has no path to w
   the relations it lands on; `global` answers from the community reports; `unified`
   searches the source text and the entity graph in parallel and answers from both,
   which reaches a figure that survived into a chunk but not into any entity
-  description. Answers carry `[CITE:n]` markers that resolve to the source file.
+  description. Answers carry `[CITE:n]` markers that resolve to the source file,
+  and `Answer.evidence(find=...)` prints the retrieved text around a figure, so an
+  answer can be checked against what was read rather than taken on trust.
+
+`unified` is also the one scope that does not get the chat key through the service
+object: it asks the retriever for a `chat_api_key` attribute, `UnifiedRetriever`
+keeps its constructor arguments in a kwargs dict, and the lookup falls through to
+the environment. The retriever bootstrap sets `CHAT_API_KEY` for it. Left alone the
+retrieval succeeds and only the answer fails, reported as "response generation
+failed".
 
 ```python
 from sysml import nl
