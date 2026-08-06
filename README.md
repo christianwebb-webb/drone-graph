@@ -12,7 +12,9 @@ export CHAT_API_KEY=sk-...      # OpenAI
 python build.py                 # parse -> project -> enrich
 ```
 
-Then open `DEMO.ipynb`.
+Then open `simple-demo.ipynb`, which does the whole thing end to end.
+
+You must have the 3 requisite Arango repos cloned adjacent to this one.
 
 ## The pipeline
 
@@ -21,6 +23,8 @@ Then open `DEMO.ipynb`.
 behind, so a rerun can start anywhere.
 
 ### 1. parse — `sysml/pipeline/parse.py`
+
+NOTE: for simplicity for now I just threw all 3 models in that folder and we build a graph of them together, since this is just a POC. We would change this for any bigger project.
 
 Reads every `.sysml` file under `models/` and writes `out/model.json`: a list of
 elements and the relations between them, with every element carrying the file and
@@ -61,24 +65,29 @@ step that costs money, and it caches to `out/`, so a second run is free.
   `sysml/aql_examples.md`, which teaches it how SysML concepts are laid out in this
   graph. Best at analytical questions ("which requirements does nothing satisfy?").
   Every answer comes back with the AQL that produced it.
-- **GraphRAG** — embed the question, vector-search entities, chunks and community
-  reports, expand one hop over the edges, answer from what came back. Best at
+- **GraphRAG** — the retriever service, run against this graph. `local` does hybrid
+  vector + BM25 search over the entities, fuses the two rankings, and expands over
+  the relations it lands on; `global` answers from the community reports; `unified`
+  searches the source text and the entity graph in parallel and answers from both,
+  which reaches facts stated in a `doc` comment that no element name resembles.
+  Answers carry `[CITE:n]` markers that resolve to the source file. Best at
   descriptive and whole-model questions.
 
-## Layout
-
-```
-build.py              runs all three steps
-sysml/
-  config.py           paths, connection settings, collection names
-  nl.py               the two question-asking paths
-  aql_examples.md     the only place domain knowledge is written down
-  pipeline/           parse -> project -> enrich
-models/               the SysML sources (vendored)
-out/                  model.json, embedding cache, community reports (gitignored)
-DEMO.ipynb            the walkthrough
-misc-tests.ipynb      the long version: everything that tries to break it
+```python
+from sysml import nl
+nl.graphrag("what does the drone battery do?").show()
+nl.graphrag("what does this model cover?", scope="global").show()
 ```
 
-`nl.py`'s AQLizer path needs the `natural-language-service` repo cloned next to this
-one.
+## How the Arango repos are used
+
+
+`graphrag_importer` - The schema. Collection names, the `embedding` field and the edge vocabulary are imported from `graphrag.naming`, so an importer-side reader finds everything where it expects it 
+`graphrag_retrievers` - The whole GraphRAG read path — `RetrievalService`, its local and global retrievers, the hybrid search indexes it builds for itself, and its citations 
+`autograph` - `DataStorage` builds the vector indexes, including the `defaultNProbe` that keeps a search from silently reading part of the index 
+`natural-language-service` - `txt2aql` writes and runs the AQL for the AQLizer path 
+
+The two services normally run as pods beside the platform. Running them here means
+supplying the few things a pod would get from its surroundings: a database JWT
+(ArangoDB issues one at `/_open/auth`), a sink for progress reporting, and a token
+validator. Everything under those is the services' own code, unmodified.

@@ -31,14 +31,16 @@ The corpus is three SysML v2 models projected into the graphrag_importer schema.
   `is_library` true for a name referenced by the model but declared outside it
 
 `sysml_Relations` is the edge collection and holds every edge kind.
-  `type` is the importer's closed five-value vocabulary:
-     `RELATED_TO`, `MENTIONED_IN`, `PART_OF`, `IN_COMMUNITY`, `HAS_PARENT`
+  `type` is the importer's own closed vocabulary:
+     `RELATED_TO`, `MENTIONED_IN`, `PART_OF`, `IN_COMMUNITY`, `SUB_COMMUNITY_OF`
   `relationship_type` on a `RELATED_TO` edge is the **authored SysML relation**:
      `owns`, `typedBy`, `specializes`, `redefines`, `satisfies`, `refines`,
      `derives`, `performs`, `subject`, `exhibits`, `connects`, `transitionsTo`,
      `variantOf`, `valueRef`, `imports`, `sliceOf`
   Filtering `type == 'RELATED_TO'` alone gives every SysML relation mixed together.
   A question about a specific relation must also filter `relationship_type`.
+  The structural edges have no `relationship_type`, so grouping by it counts SysML
+  relations only. Group by `type` to count the structural edges as well.
 
 Names are stored exactly as the model declares them and matching is case-sensitive.
 `Apollo11Mission`, `SaturnV` and `forestFireObservationDrone` will not match a

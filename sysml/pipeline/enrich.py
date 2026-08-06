@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -35,6 +38,10 @@ from .project import key_of
 
 CACHE = config.OUT / "embeddings.npz"
 REPORTS = config.OUT / "reports.json"
+
+# autograph, cloned next to this project. Only DataStorage is used, and only to
+# build the vector indexes -- see `ensure_vector_index`.
+AUTOGRAPH_REPO = config.ROOT.parent / "autograph"
 
 # Relations that carry engineering meaning rather than containment. Communities are
 # found over these alone: `owns` connects the entire model into one blob, and a
@@ -110,33 +117,70 @@ def write_vectors(db, collection: str, field: str, vectors: dict[str, list[float
     return len(updates)
 
 
+def data_storage(db):
+    """autograph's DataStorage, pointed at the local database.
+
+    Its config classes read the environment in their class bodies, so
+    EMBEDDING_DIM has to be set before `corpus_graph` is imported: the index is
+    built for `EmbeddingConfig.DIMENSION` rather than for the length of the
+    vectors it finds, and a late setenv leaves that at autograph's default of 512
+    while ours are 768. Both read the same variable, so setting it from
+    config.EMBED_DIM keeps the two definitions of "how wide is a vector" in step.
+
+    DataStorage takes a plain password-authed database -- its documented legacy
+    usage. The platform's connection manager only matters when a JWT has to be
+    renewed mid-run, which is not a thing that happens here.
+    """
+    os.environ.setdefault("EMBEDDING_DIM", str(config.EMBED_DIM))
+    if str(AUTOGRAPH_REPO) not in sys.path:
+        sys.path.insert(0, str(AUTOGRAPH_REPO))
+    try:
+        from corpus_graph.datastorage import DataStorage
+    except ImportError as exc:
+        raise RuntimeError(
+            f"cannot import corpus_graph ({exc}). Clone autograph next to this project."
+        ) from exc
+    # corpus_graph/logger.py attaches a StreamHandler to stdout at import time, and
+    # the index build is chatty. Same treatment as txt2aql gets in nl.py: keep the
+    # logs, move them off stdout.
+    log = logging.getLogger("corpus_graph")
+    for handler in list(log.handlers):
+        if getattr(handler, "stream", None) is sys.stdout:
+            log.removeHandler(handler)
+    if not log.handlers:
+        log.addHandler(logging.StreamHandler(sys.stderr))
+    return DataStorage(db)
+
+
 def ensure_vector_index(db, collection: str) -> str:
-    """ArangoDB refuses a vector index unless every document carries the field."""
+    """Build the vector index with autograph's DataStorage.
+
+    It sizes nLists itself, waits out the background training, and -- the part
+    worth having -- writes `defaultNProbe` into the index. nProbe is how many of
+    the index's partitions a search opens, and left at the default of 1 a search
+    reads a sliver of the collection and silently returns fewer rows than the
+    LIMIT asked for. Carrying the setting on the index means every query gets it
+    without having to remember to pass it.
+
+    The existing index is dropped first rather than adopted: autograph keeps a
+    ready index as-is, which is right for its own pipeline but wrong here, where
+    this runs directly after the vectors were rewritten.
+    """
     coll = db.collection(collection)
-    for idx in coll.indexes():
-        if idx.get("type") == "vector":
-            coll.delete_index(idx["id"])
+    config.drop_vector_indexes(db, collection)
+    # ArangoDB refuses a vector index unless every document carries the field.
     missing = next(iter(db.aql.execute(
         f"RETURN LENGTH(FOR d IN @@c FILTER !IS_LIST(d.{config.EMBEDDING_FIELD}) RETURN 1)",
         bind_vars={"@c": collection})))
     if missing:
         return f"no index: {missing} rows have no {config.EMBEDDING_FIELD}"
-    # nLists is how many partitions the index splits into, and a search visits
-    # `nProbe` of them. Over-partitioning is the failure that looks like a bad
-    # embedding: with nLists=392 over 2.4k rows a LIMIT 10 search came back with 3
-    # rows, because 389 partitions were never opened. sqrt(n) lists probed
-    # config.N_PROBE deep covers enough of the collection to behave like a scan.
-    n = coll.count()
-    for n_lists in (max(1, min(n, int(n ** 0.5))), max(1, n // 10), 1):
-        try:
-            coll.add_index({"name": f"{collection}_vec", "type": "vector",
-                            "fields": [config.EMBEDDING_FIELD],
-                            "params": {"metric": "cosine", "dimension": config.EMBED_DIM,
-                                       "nLists": n_lists}})
-            return f"vector index, nLists={n_lists} (searched with nProbe={config.N_PROBE})"
-        except Exception:
-            continue
-    return "no index: creation failed"
+    data_storage(db).create_vector_index_on_field(coll, config.EMBEDDING_FIELD)
+    index = next((i for i in coll.indexes() if i.get("type") == "vector"), None)
+    if index is None:
+        return "no index: creation failed"
+    params = index.get("params", {})
+    return (f"vector index, nLists={params.get('nLists')}, "
+            f"defaultNProbe={params.get('defaultNProbe')}")
 
 
 # ------------------------------------------------------------------ communities
@@ -315,16 +359,16 @@ def write_communities(db, level0: list[dict], level1: list[dict],
                 "_key": key_of(f"incomm:{c['id']}:{name}"),
                 "_from": f"{config.ENTITIES}/{key_of(name)}",
                 "_to": f"{config.COMMUNITIES}/{c['id']}",
-                "type": "IN_COMMUNITY", "relationship_type": "IN_COMMUNITY",
+                "type": "IN_COMMUNITY",
                 "description": f"{name} belongs to {c['title']}",
                 "weight": 1.0, "source_id": c["id"], "order": c["level"],
             })
         if c.get("parent"):
             edges.append({
-                "_key": key_of(f"hasparent:{c['id']}"),
+                "_key": key_of(f"subcommunity:{c['id']}"),
                 "_from": f"{config.COMMUNITIES}/{c['id']}",
                 "_to": f"{config.COMMUNITIES}/{c['parent']}",
-                "type": "HAS_PARENT", "relationship_type": "HAS_PARENT",
+                "type": config.SUB_COMMUNITY_OF,
                 "description": f"{c['title']} is part of a larger community",
                 "weight": 1.0, "source_id": c["id"], "order": 0,
             })
@@ -333,11 +377,15 @@ def write_communities(db, level0: list[dict], level1: list[dict],
     rel.delete_many([{"_key": e["_key"]} for e in edges], silent=True, sync=False)
     for i in range(0, len(edges), 1000):
         rel.import_bulk(edges[i:i + 1000], on_duplicate="replace")
-    # A stale IN_COMMUNITY edge from a previous run would point at a deleted
-    # community, so drop anything not written this time.
+    # A stale membership edge from a previous run would point at a deleted
+    # community, so drop anything not written this time. HAS_PARENT is the name
+    # this project used before the vocabulary came from the importer; a graph
+    # built by the old code still has those edges and they are cleaned up here.
     db.aql.execute(
-        f"FOR r IN {config.RELATIONS} FILTER r.type IN ['IN_COMMUNITY', 'HAS_PARENT'] "
-        "FILTER DOCUMENT(r._to) == null REMOVE r IN " + config.RELATIONS)
+        f"FOR r IN {config.RELATIONS} "
+        f"FILTER r.type IN ['IN_COMMUNITY', '{config.SUB_COMMUNITY_OF}', 'HAS_PARENT'] "
+        "FILTER DOCUMENT(r._to) == null OR r.type == 'HAS_PARENT' "
+        "REMOVE r IN " + config.RELATIONS)
     return len(docs)
 
 

@@ -8,10 +8,13 @@ gives it is `aql_examples`, read from `aql_examples.md` -- the argument
 never passes. There are no hand-written query functions here: if an answer is wrong
 the fix goes in that file, not into Python.
 
-`graphrag(question)` -- the retrieval path a GraphRAG reader takes over an importer
-corpus: embed the question, vector-search the entities, the chunks and the community
-reports, expand one hop over the typed edges, and answer from what came back. This
-is the path that handles descriptive questions; AQLizer handles analytical ones.
+`graphrag(question)` -- the GraphRAG retriever service from graphrag_retrievers,
+run in-process against the local database. `local` is hybrid vector + BM25 search
+over the entities fused with reciprocal rank, then expanded over the relations;
+`global` answers from the community reports; `unified` searches the source text and
+the entity graph in parallel. All three come back with citations that resolve to a
+source file. This is the path for descriptive and whole-model
+questions; AQLizer handles analytical ones.
 
 Every AQLizer answer carries the AQL that produced it, because a generated query
 that is subtly wrong returns no rows, and a fluent sentence over no rows is
@@ -19,11 +22,14 @@ indistinguishable from a correct answer about something genuinely absent.
 
     python -m sysml.nl "which requirements does nothing satisfy?"
     python -m sysml.nl --graphrag "what does the drone battery do?"
+    python -m sysml.nl --graphrag --scope global "what does this model cover?"
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import io
 import json
 import logging
 import os
@@ -34,32 +40,61 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from openai import OpenAI
+from arango import ArangoClient
 
 from . import config
 from .pipeline.enrich import embed_query
 
-SERVICE_REPO = config.ROOT.parent / "natural-language-service"
+SERVICE_REPO = config.SERVICE_REPO
+RETRIEVER_REPO = config.ROOT.parent / "graphrag_retrievers"
+OPENAI_URL = "https://api.openai.com/v1"
 
 # The service's read-only check (WRITE_OPERATIONS) does not include TRUNCATE, so a
 # generated `FOR c IN [...] TRUNCATE c` passes it. Nothing reaches the database
 # without clearing this first.
 MUTATION = re.compile(r"\b(INSERT|UPDATE|REPLACE|REMOVE|UPSERT|TRUNCATE)\b", re.I)
 
-ANSWER_RULES = """Answer the question from the context below and nothing else.
+# Passed to the retriever as `response_instructions`, which is its supported way to
+# shape an answer.
+ANSWER_RULES = """Answer from the retrieved context and nothing else.
 
 - Synthesising across the context is expected. Grouping, comparing and summarising
   what is there -- including the community summaries -- is answering, not guessing.
   What is forbidden is a fact the context does not contain.
-- Cite every specific claim with the file and line it came from, written like
-  (Drone_BaseArchitecture.sysml:22). Copy the real path and number out of the
-  context -- never write the words "source_file" or "source_line" in the answer.
 - If the context genuinely lacks what was asked, say "the model does not say".
   Never fall back on general knowledge about Apollo, spacecraft or drones.
 - A number must come from an attribute value in the context. If an attribute is an
   expression rather than a value, say it is computed and give the expression.
 - If the context shows two facts that contradict each other, report the conflict
   rather than choosing one."""
+
+
+def token() -> str:
+    """A database JWT. Both services authenticate with one rather than a password."""
+    r = requests.post(f"{config.ARANGO_URL}/_open/auth", timeout=15,
+                      json={"username": config.ARANGO_USER, "password": config.ARANGO_PASS})
+    r.raise_for_status()
+    return r.json()["jwt"]
+
+
+def logs_to_stderr(*names: str) -> None:
+    """Move a service's logging off stdout.
+
+    Both services attach a stdout handler at import time, which corrupts anything
+    reading stdout. The logs are worth keeping -- the retriever narrates what it
+    searched and why -- so they move rather than go away. The stream is reopened as
+    UTF-8 because the retriever logs arrows, and those raise on a cp1252 console.
+    A notebook's stderr has no file descriptor behind it, and there it is already
+    unicode-safe, so it is used as-is.
+    """
+    try:
+        stream: Any = open(sys.stderr.fileno(), "w", encoding="utf-8", closefd=False)
+    except (AttributeError, OSError, io.UnsupportedOperation):
+        stream = sys.stderr
+    for name in names:
+        log = logging.getLogger(name)
+        log.handlers = [logging.StreamHandler(stream)]
+        log.propagate = False
 
 
 def _text(value: Any) -> str:
@@ -131,14 +166,7 @@ class Aqlizer:
                 f"cannot import txt2aql ({exc}). Clone natural-language-service next "
                 "to this project and install its deps into this interpreter."
             ) from exc
-        # txt2aql/logger.py attaches a StreamHandler to stdout at import time, which
-        # corrupts anything parsing stdout. The logs are useful; move them to stderr.
-        log = logging.getLogger("txt2aql")
-        for handler in list(log.handlers):
-            if getattr(handler, "stream", None) is sys.stdout:
-                log.removeHandler(handler)
-        if not log.handlers:
-            log.addHandler(logging.StreamHandler(sys.stderr))
+        logs_to_stderr("txt2aql")
 
     @property
     def examples(self) -> str:
@@ -151,17 +179,11 @@ class Aqlizer:
             self._service = Txt2AqlService()
         return self._service
 
-    def token(self) -> str:
-        r = requests.post(f"{config.ARANGO_URL}/_open/auth", timeout=15,
-                          json={"username": config.ARANGO_USER, "password": config.ARANGO_PASS})
-        r.raise_for_status()
-        return r.json()["jwt"]
-
     def graph(self):
         """The LangChain ArangoGraph the service builds its schema picture from."""
         if self._graph is None:
             from langchain_arangodb import ArangoGraph
-            db = self.service.get_db_client().db(name=config.DB_NAME, user_token=self.token())
+            db = self.service.get_db_client().db(name=config.DB_NAME, user_token=token())
             self._graph = ArangoGraph(db=db, generate_schema_on_init=True,
                                       schema_sample_ratio=0, schema_graph_name=None,
                                       schema_include_examples=True, schema_list_limit=32,
@@ -221,33 +243,130 @@ class Aqlizer:
 # ------------------------------------------------------------------- GraphRAG
 
 
-ENTITY_SEARCH = f"""
-FOR e IN {config.ENTITIES}
-  LET score = APPROX_NEAR_COSINE(e.{config.EMBEDDING_FIELD}, @q, {{nProbe: {config.N_PROBE}}})
-  SORT score DESC
-  LIMIT @k
-  RETURN {{name: e.entity_name, type: e.entity_type, at: CONCAT(e.source_file, ':', e.source_line),
-           description: e.description, score}}"""
+class Retriever:
+    """graphrag_retrievers' RetrievalService, pointed at the local database.
 
-CHUNK_SEARCH = f"""
-FOR c IN {config.CHUNKS}
-  LET score = APPROX_NEAR_COSINE(c.{config.EMBEDDING_FIELD}, @q, {{nProbe: {config.N_PROBE}}})
-  SORT score DESC
-  LIMIT @k
-  RETURN {{at: CONCAT(c.file_name, ':', c.start_line, '-', c.end_line),
-           content: c.content, score}}"""
+    `local` is entity-centred: hybrid vector + BM25 search over the entities,
+    fused with reciprocal rank, then expanded over the relations touching what it
+    found. `global` answers from the community reports, which is what a question
+    about the model as a whole needs. `unified` searches the chunks of source text
+    and the entity graph in parallel and answers from both -- `local` reaches a
+    chunk only through an entity that matched first, so a fact written in a `doc`
+    comment that no element name resembles is out of its reach.
 
-COMMUNITY_SEARCH = f"""
-FOR c IN {config.COMMUNITIES}
-  LET score = APPROX_NEAR_COSINE(c.{config.EMBEDDING_FIELD}, @q, {{nProbe: {config.N_PROBE}}})
-  SORT score DESC
-  LIMIT @k
-  RETURN {{title: c.title, level: c.level, members: c.occurrence,
-           report: c.report_string, score}}"""
+    The service normally runs as a pod beside the platform, so three of the things
+    it reaches for at startup are supplied here instead: a JWT, a service-status
+    sink, and a token validator. Everything below those is the service's own code.
+    """
 
-# The edge collection has no ANN index -- ArangoDB requires the vector field on
-# every document and only RELATED_TO edges carry one. Exact cosine over 5k edges is
-# fast, and unlike APPROX_NEAR_COSINE it can be filtered by relationship_type.
+    def __init__(self, level: int = 1):
+        self.level = level
+        self._service = None
+        self._bootstrap()
+
+    def _bootstrap(self) -> None:
+        if str(RETRIEVER_REPO) not in sys.path:
+            sys.path.insert(0, str(RETRIEVER_REPO))
+        # Collection names are derived from the project name, and the retriever
+        # reads its own database name from the environment.
+        os.environ.setdefault("DB_NAME", config.DB_NAME)
+        os.environ.setdefault("db_name", config.DB_NAME)
+        try:
+            import retrievers.global_retriever_ng.global_retriever_ng as global_ng
+            import retrievers.local_retriever.local_retriever as local
+            import retrievers.service as service
+            import retrievers.unified_retriever.unified_retriever as unified
+            import retrievers.utils.auth as auth
+            import retrievers.utils.metadata_helpers as metadata
+        except ImportError as exc:
+            raise RuntimeError(
+                f"cannot import retrievers ({exc}). Clone graphrag_retrievers next "
+                "to this project and install its deps into this interpreter."
+            ) from exc
+
+        async def open_database(arangodb_url: str, db_name: str, **_):
+            # ArangoDB issues an acceptable JWT itself, which is what the retriever
+            # wants: it connects with auth_method="jwt".
+            client = ArangoClient(hosts=arangodb_url)
+            return token(), client, client.db(name=db_name, auth_method="jwt",
+                                              user_token=token())
+
+        async def no_status(*_args, **_kwargs) -> None:
+            """Progress goes to the GenAI metadata store; nothing here watches it."""
+
+        async def token_valid(_token):
+            """Every token here was minted a moment earlier, so it is valid."""
+            return True, config.ARANGO_USER
+
+        auth._initialize_database_connection = open_database
+        auth.is_valid_token = token_valid
+        metadata.update_service_status = no_status
+        # Each retriever imports these by name, so the shim has to be planted in
+        # every module that will call one -- `unified` mid-query, when it renews.
+        for module in (local, global_ng, unified, service):
+            for name, shim in (("update_service_status", no_status),
+                               ("is_valid_token", token_valid)):
+                if hasattr(module, name):
+                    setattr(module, name, shim)
+        self._module = service
+        logs_to_stderr("graphrag", "retrievers")
+
+    @property
+    def service(self):
+        if self._service is None:
+            self._service = self._module.RetrievalService(
+                arangodb_url=config.ARANGO_URL, db_name=config.DB_NAME,
+                level=self.level, chat_api_provider="openai",
+                embedding_api_provider="openai",
+                chat_api_url=OPENAI_URL, embedding_api_url=OPENAI_URL,
+                chat_api_key=config.openai_key(), embedding_api_key=config.openai_key(),
+                chat_model=config.CHAT_MODEL, embedding_model=config.EMBED_MODEL,
+                embedding_dim=config.EMBED_DIM, username=config.ARANGO_USER)
+        return self._service
+
+    async def ask_async(self, question: str, scope: str = "local") -> Answer:
+        kinds = {"local": self._module.QueryType.LOCAL,
+                 "global": self._module.QueryType.GLOBAL,
+                 "unified": self._module.QueryType.UNIFIED}
+        if scope not in kinds:
+            raise ValueError(f"scope must be one of {sorted(kinds)}, not {scope!r}")
+        try:
+            result = await self.service.process_query(
+                query=question, query_type=kinds[scope], validated_token=token(),
+                response_instructions=ANSWER_RULES, use_cache=False,
+                # Straight to the retriever asked for. The planner would run a
+                # global pass first to decide the route, and partition selection
+                # reads the AutoGraph corpus collections, which a graph built
+                # from a single module does not have.
+                use_llm_planner=False, auto_select_partitions=False)
+        except Exception as exc:
+            return Answer(question, "", error=f"{type(exc).__name__}: {exc}")
+        if not isinstance(result, dict):
+            return Answer(question, str(result))
+        if result.get("status") == "error":
+            return Answer(question, "", error=str(result.get("error")))
+        # `local` and `global` answer under `result` with everything else nested in
+        # `metadata`; `unified` answers under `llm_response` and keeps its citations
+        # at the top level.
+        meta = result.get("metadata") or {}
+        answer = result.get("result") or result.get("llm_response") or ""
+        citations = meta.get("citation_mapping") or result.get("citation_mapping") or {}
+        # A [CITE:n] in the answer indexes this map, and each entry names the file
+        # the text came from -- so the citations resolve to real sources.
+        rows = [{"cite": key, "source": value.get("citable_url")}
+                for key, value in sorted(citations.items(), key=lambda kv: str(kv[0]))]
+        context = meta.get("formatted_context") or result.get("formatted_context") or ""
+        return Answer(question, str(answer).strip(), rows=rows, context=str(context))
+
+    def ask(self, question: str, scope: str = "local") -> Answer:
+        return asyncio.run(self.ask_async(question, scope))
+
+
+# The one retrieval this adds: the edge collection has no ANN index -- ArangoDB
+# requires the vector field on every document and only RELATED_TO edges carry one.
+# Exact cosine over 5k edges is fast, and unlike an index scan it can be filtered
+# by relationship_type, so "the nearest `satisfies` edges to this phrase" is a
+# query rather than a post-filter.
 RELATION_SEARCH = f"""
 FOR r IN {config.RELATIONS}
   FILTER r.type == 'RELATED_TO' AND IS_LIST(r.{config.EMBEDDING_FIELD})
@@ -258,28 +377,6 @@ FOR r IN {config.RELATIONS}
   RETURN {{description: r.description, relation: r.relationship_type,
            at: CONCAT(r.source_file, ':', r.source_line), score}}"""
 
-NEIGHBOURS = f"""
-FOR e IN {config.ENTITIES}
-  FILTER e.entity_name IN @names
-  FOR other, edge IN 1..1 ANY e {config.RELATIONS}
-    FILTER edge.type == 'RELATED_TO'
-    RETURN DISTINCT {{from: DOCUMENT(edge._from).entity_name,
-                      relation: edge.relationship_type,
-                      to: DOCUMENT(edge._to).entity_name,
-                      at: CONCAT(edge.source_file, ':', edge.source_line)}}"""
-
-
-def search_entities(db, question: str, k: int = 10, vector=None) -> list[dict]:
-    return list(db.aql.execute(ENTITY_SEARCH, bind_vars={"q": vector or embed_query(question), "k": k}))
-
-
-def search_chunks(db, question: str, k: int = 4, vector=None) -> list[dict]:
-    return list(db.aql.execute(CHUNK_SEARCH, bind_vars={"q": vector or embed_query(question), "k": k}))
-
-
-def search_communities(db, question: str, k: int = 3, vector=None) -> list[dict]:
-    return list(db.aql.execute(COMMUNITY_SEARCH, bind_vars={"q": vector or embed_query(question), "k": k}))
-
 
 def search_relations(db, question: str, k: int = 8, relation: str | None = None,
                      vector=None) -> list[dict]:
@@ -287,63 +384,43 @@ def search_relations(db, question: str, k: int = 8, relation: str | None = None,
         "q": vector or embed_query(question), "k": k, "relation": relation}))
 
 
-def graphrag(db, question: str, entities: int = 10, chunks: int = 3,
-             communities: int = 2, expand: bool = True) -> Answer:
-    """Retrieve over the projection, then answer from what came back.
-
-    Four sources, because the schema offers four and a question rarely needs the
-    same one twice: entity descriptions for "what is X", chunks for the authored
-    source text, community reports for questions about the model as a whole, and
-    the typed edges for how things connect.
-    """
-    vector = embed_query(question)
-    hits = search_entities(db, question, entities, vector)
-    parts: list[str] = []
-
-    if communities:
-        for c in search_communities(db, question, communities, vector):
-            parts.append(f"[community: {c['title']}, {c['members']} members]\n{c['report']}")
-    for h in hits:
-        parts.append(f"[entity: {h['name']} ({h['type']}) at {h['at']}]\n{h['description']}")
-    if expand and hits:
-        edges = list(db.aql.execute(NEIGHBOURS, bind_vars={"names": [h["name"] for h in hits]}))
-        if edges:
-            lines = [f"{e['from']} --{e['relation']}--> {e['to']}  ({e['at']})" for e in edges[:120]]
-            parts.append("[typed relations touching those elements]\n" + "\n".join(lines))
-    for c in search_chunks(db, question, chunks, vector):
-        parts.append(f"[source text {c['at']}]\n{c['content']}")
-
-    context = "\n\n".join(parts)
-    client = OpenAI(api_key=config.openai_key())
-    resp = client.chat.completions.create(
-        model=config.CHAT_MODEL, temperature=0,
-        messages=[{"role": "system", "content": ANSWER_RULES},
-                  {"role": "user", "content": f"CONTEXT\n-------\n{context}\n\nQUESTION\n--------\n{question}"}])
-    return Answer(question, resp.choices[0].message.content.strip(), context=context,
-                  rows=[{"entity": h["name"], "score": round(h["score"], 3)} for h in hits])
-
-
 # ----------------------------------------------------------------------- main
 
 
-_SHARED: Aqlizer | None = None
+# Both are expensive to build -- schema generation for one, index checks and a
+# database connection for the other -- and cheap to keep, so each is built once.
+_AQLIZER: Aqlizer | None = None
+_RETRIEVER: Retriever | None = None
 
 
 def instance() -> Aqlizer:
-    global _SHARED
-    if _SHARED is None:
-        _SHARED = Aqlizer()
-    return _SHARED
+    global _AQLIZER
+    if _AQLIZER is None:
+        _AQLIZER = Aqlizer()
+    return _AQLIZER
+
+
+def retriever() -> Retriever:
+    global _RETRIEVER
+    if _RETRIEVER is None:
+        _RETRIEVER = Retriever()
+    return _RETRIEVER
+
+
+def graphrag(question: str, scope: str = "local") -> Answer:
+    return retriever().ask(question, scope)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("question")
     ap.add_argument("--graphrag", action="store_true", help="retrieval path instead of AQLizer")
+    ap.add_argument("--scope", default="local", choices=("local", "global", "unified"),
+                    help="which retriever answers (--graphrag only)")
     ap.add_argument("--stock", action="store_true", help="AQLizer with no aql_examples")
     args = ap.parse_args()
     if args.graphrag:
-        graphrag(config.db(), args.question).show()
+        graphrag(args.question, args.scope).show()
     else:
         instance().ask(args.question, primed=not args.stock).show()
 

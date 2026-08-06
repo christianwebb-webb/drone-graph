@@ -11,10 +11,16 @@ reader:
   Entity     one SysML element, described in prose so it can be embedded
   Relation   RELATED_TO for an authored SysML relation, with the relation name in
              `relationship_type` (the importer's own field for typed edges), plus
-             MENTIONED_IN, PART_OF, IN_COMMUNITY and HAS_PARENT for structure
+             MENTIONED_IN, PART_OF, IN_COMMUNITY and SUB_COMMUNITY_OF for structure
 
-`type` is closed at five values and exists for validation, so a sixth is not an
-option. `relationship_type` is open, which is why the SysML relation lives there.
+`type` is closed and exists for validation, so inventing a value is not an option.
+`relationship_type` is open, which is why the SysML relation lives there. The
+vocabulary is imported in config rather than copied -- see the note there.
+
+The two fields hold two vocabularies and are never mixed: `type` is only ever one
+of the importer's five constants, and `relationship_type` is only ever a SysML
+relation. The importer leaves it unset on its structural edges, so a query that
+collapses it sees SysML relations and nothing else.
 
     python -m sysml.pipeline.project
 """
@@ -150,7 +156,7 @@ def build(model: dict, source_root: Path) -> dict[str, list[dict]]:
             edges.append({
                 "_key": key_of(f"partof:{ckey}"),
                 "_from": f"{config.CHUNKS}/{ckey}", "_to": f"{config.DOCUMENTS}/{doc_key}",
-                "type": "PART_OF", "relationship_type": "PART_OF",
+                "type": "PART_OF",
                 "description": f"chunk {i} of {rel}", "weight": 1.0,
                 "source_id": ckey, "order": i,
             })
@@ -192,7 +198,7 @@ def build(model: dict, source_root: Path) -> dict[str, list[dict]]:
             edges.append({
                 "_key": key_of(f"mention:{ekey}:{ckey}"),
                 "_from": f"{config.ENTITIES}/{ekey}", "_to": f"{config.CHUNKS}/{ckey}",
-                "type": "MENTIONED_IN", "relationship_type": "MENTIONED_IN",
+                "type": "MENTIONED_IN",
                 "description": f"{element['name']} is declared in {element['sourceFile']}",
                 "weight": 1.0, "source_id": ckey, "order": 0,
             })
