@@ -78,6 +78,24 @@ CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o")
 SUB_COMMUNITY_OF = RelationshipTypes.SUB_COMMUNITY_OF
 EDGE_TYPES = tuple(sorted(RelationshipTypes.get_expected_types() | {SUB_COMMUNITY_OF}))
 
+# The analogy layer's edge label, and it is deliberately not the importer's. An
+# analogy is not something a SysML file states, so it cannot be a RELATED_TO
+# carrying a `relationship_type` -- that would make a resemblance we computed
+# indistinguishable from a relation an engineer wrote, and would land in every
+# count that groups by `relationship_type`. SIMILAR_TO is autograph's own label
+# for "these two were found to resemble each other", which is exactly this.
+if str(AUTOGRAPH_REPO) not in sys.path:
+    sys.path.insert(0, str(AUTOGRAPH_REPO))
+try:
+    from corpus_graph.naming import EDGE_LABEL_SIMILAR_TO
+except ImportError as exc:  # pragma: no cover - a missing clone, not a code path
+    raise RuntimeError(
+        f"cannot import corpus_graph.naming ({exc}). Clone autograph next to this "
+        "project -- the similarity edge label comes from it."
+    ) from exc
+
+SIMILAR_TO = EDGE_LABEL_SIMILAR_TO
+
 # Which source tree each file belongs to, and the label used everywhere downstream.
 MODELS_INDEX = {
     "apollo-11-sysml-v2": "apollo-11",

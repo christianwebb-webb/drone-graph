@@ -40,6 +40,13 @@ MODIFIERS = {
 
 # Statement kinds that become elements. The metatype is this name plus Definition or
 # Usage depending on whether `def` follows; Package has neither form.
+#
+# ONTOLOGY (1 of 3): the entity half. These are the `entity_type` values that end up
+# on every Entity. GraphRAG's extraction path takes the equivalent list as its
+# `entity_types` argument and prompts an LLM to use only those; here the same
+# vocabulary is enforced by recognising the keyword in the grammar, so an element is
+# whatever SysML says it is. Nothing declares this list as data -- the other two
+# places have to agree with it by hand.
 KINDS = {
     "package": "Package", "part": "Part", "action": "Action", "state": "State",
     "port": "Port", "item": "Item", "attribute": "Attribute", "requirement": "Requirement",

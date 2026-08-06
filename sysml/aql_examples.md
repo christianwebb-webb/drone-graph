@@ -30,6 +30,11 @@ The corpus is three SysML v2 models projected into the graphrag_importer schema.
   `is_variation` / `is_variant` variation points and their alternatives
   `is_library` true for a name referenced by the model but declared outside it
 
+ONTOLOGY (3 of 3): the two lists below -- the entity types and the SysML relations --
+are what a query has to filter on, written out for the model that generates the AQL.
+They restate what parse.py recognises and what project.py phrases, so all three have
+to agree; nothing checks that they do.
+
 `sysml_Relations` is the edge collection and holds every edge kind.
   `type` is the importer's own closed vocabulary:
      `RELATED_TO`, `MENTIONED_IN`, `PART_OF`, `IN_COMMUNITY`, `SUB_COMMUNITY_OF`
@@ -287,6 +292,80 @@ FOR e IN sysml_Entities
     FILTER edge.relationship_type == "transitionsTo"
     RETURN {to: next.name, trigger: edge.trigger,
             at: CONCAT(next.source_file, ":", next.source_line)}
+```
+
+## Analogies between models
+
+A `SIMILAR_TO` edge is the one kind of edge no `.sysml` file states. It joins two
+elements in **different** models that were found to resemble each other, and it is
+what a question comparing two vehicles is asking about -- there is no authored
+relation across a model boundary, so a traversal that filters `RELATED_TO` will
+find nothing between Apollo and the drone.
+
+It carries `cosine` (how close the two descriptions are, higher is closer),
+`analogy_role` (the kind of element both are -- `Part`, `Port`, `Requirement`) and
+a `description` already written as a sentence. It has no `relationship_type`,
+because it is not a SysML relation.
+
+An edge is stored in one direction only and means the same thing read either way,
+so traverse it with `ANY`, never `OUTBOUND`.
+
+The start of a traversal is one vertex, never a list. Select the elements with an
+ordinary `FOR` and traverse from the loop variable; a subquery in the start
+position returns no rows rather than an error, which is indistinguishable from an
+element genuinely having no counterpart.
+
+What plays a given element's role in another model:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.name == "ctrlPort"
+  FOR other, edge IN 1..1 ANY e sysml_Relations
+    FILTER edge.type == "SIMILAR_TO"
+    SORT edge.cosine DESC
+    RETURN {element: e.name, counterpart: other.name, model: other.model,
+            cosine: edge.cosine,
+            at: CONCAT(other.source_file, ":", other.source_line)}
+```
+
+The same shape over a whole class of elements -- every drone part with an Apollo
+counterpart:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.model == "drone-logical"
+     AND e.entity_type IN ["PartUsage", "PartDefinition"]
+  FOR other, edge IN 1..1 ANY e sysml_Relations
+    FILTER edge.type == "SIMILAR_TO" AND other.model == "apollo-11"
+    SORT edge.cosine DESC
+    LIMIT 5
+    RETURN {drone: e.name, apollo: other.name, cosine: edge.cosine}
+```
+
+Every analogy between two named models, strongest first:
+
+```aql
+FOR r IN sysml_Relations
+  FILTER r.type == "SIMILAR_TO"
+  LET a = DOCUMENT(r._from), b = DOCUMENT(r._to)
+  FILTER [a.model, b.model] ALL IN ["drone-logical", "apollo-11"]
+  SORT r.cosine DESC
+  LIMIT 20
+  RETURN {a: a.name, b: b.name, role: r.analogy_role, cosine: r.cosine}
+```
+
+Which elements have no counterpart in another model at all -- the parts of one
+vehicle that nothing in the other resembles:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.model == "drone-logical" AND e.entity_type IN ["PartUsage", "PartDefinition"]
+  LET counterparts = LENGTH(
+    FOR r IN sysml_Relations
+      FILTER r.type == "SIMILAR_TO" AND (r._from == e._id OR r._to == e._id)
+      LIMIT 1 RETURN 1)
+  FILTER counterparts == 0
+  RETURN {name: e.name, at: CONCAT(e.source_file, ":", e.source_line)}
 ```
 
 Note for query writers: the service's read-only guard tests whether the strings

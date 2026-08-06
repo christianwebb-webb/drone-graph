@@ -117,6 +117,32 @@ def write_vectors(db, collection: str, field: str, vectors: dict[str, list[float
     return len(updates)
 
 
+def autograph_env() -> None:
+    """Point autograph at the local container, before `corpus_graph` is imported.
+
+    Its config classes read the environment in their class bodies, so anything set
+    afterwards is ignored. EMBEDDING_DIM matters most: the vector index is built
+    for `EmbeddingConfig.DIMENSION` rather than for the width of the vectors it
+    finds, so a late setenv leaves that at autograph's default of 512 while ours
+    are 768. The rest is what `CorpusGraphConfig.get_arangodb_config()` returns,
+    which is how DataStorage addresses the database over HTTP when it creates an
+    ArangoSearch view -- the connection object it was handed is not used there.
+
+    These are assigned rather than defaulted. `ARANGO_DEPLOYMENT_ENDPOINT` is the
+    variable a shell is most likely to already hold, pointing at a hosted
+    deployment, and deferring to it sends autograph's HTTP calls at a database
+    this project has no business writing to. It fails with a bare 401 -- a JWT
+    minted by the local container means nothing there -- which reads like a
+    permissions problem and is not one. Everything here is the local container by
+    construction, so the local values win.
+    """
+    os.environ["EMBEDDING_DIM"] = str(config.EMBED_DIM)
+    os.environ["ARANGO_DEPLOYMENT_ENDPOINT"] = config.ARANGO_URL
+    os.environ["db_name"] = config.DB_NAME
+    os.environ["ARANGODB_USER"] = config.ARANGO_USER
+    os.environ["ARANGODB_PASSWORD"] = config.ARANGO_PASS
+
+
 def data_storage(db):
     """autograph's DataStorage, pointed at the local database.
 
@@ -131,7 +157,7 @@ def data_storage(db):
     usage. The platform's connection manager only matters when a JWT has to be
     renewed mid-run, which is not a thing that happens here.
     """
-    os.environ.setdefault("EMBEDDING_DIM", str(config.EMBED_DIM))
+    autograph_env()
     if str(AUTOGRAPH_REPO) not in sys.path:
         sys.path.insert(0, str(AUTOGRAPH_REPO))
     try:

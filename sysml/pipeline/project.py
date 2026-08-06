@@ -39,6 +39,13 @@ BATCH = 1000
 
 # How a relation reads in prose. The description is embedded, so an edge is
 # retrievable by meaning and not only by traversal.
+#
+# ONTOLOGY (2 of 3): the relation half. Its keys are every `relationship_type` a
+# RELATED_TO edge can carry -- the counterpart of the `relationship_types` list
+# GraphRAG's extraction path constrains an LLM with. Here they come out of the
+# parser, so this dict has to be kept in step with what parse.py emits: a relation
+# missing from here still becomes an edge, but its description falls back to the
+# raw keyword.
 PHRASING = {
     "owns": "contains", "typedBy": "is typed by", "specializes": "specializes",
     "redefines": "redefines", "satisfies": "satisfies", "refines": "refines",
@@ -85,20 +92,31 @@ def chunk_file(path: Path, text: str) -> list[dict]:
 # ------------------------------------------------------------------- description
 
 
-def describe(element: dict, outgoing: list[tuple[str, str]]) -> str:
+def describe(element: dict, outgoing: list[tuple[str, str]], provenance: bool = True) -> str:
     """A deterministic prose rendering of an element. No LLM.
 
     This is the text that gets embedded, so it has to carry the facts a question
     might be about: what it is, where it is, what it says, what it is worth, and
     what it is attached to.
+
+    `provenance=False` drops the opening sentence and the short name and keeps the
+    rest. That form is what the analogy step embeds: the opening sentence names the
+    model, the layer and the source file, so two elements out of the same file
+    resemble each other on the strength of shared boilerplate, which is fatal to a
+    comparison whose entire purpose is to cross models. Short names go with it --
+    `flr-R073` identifies an element, it does not describe one.
     """
-    parts = [
-        f"{element['name']} is a {element['metatype']} in the {element['model']} model "
-        f"({element['layer']} layer), declared at "
-        f"{element['sourceFile']}:{element['sourceLine']}."
-    ]
-    if element.get("shortName"):
-        parts.append(f"Its short name is {element['shortName']}.")
+    parts = []
+    if not provenance:
+        parts.append(f"{element['name']}.")
+    else:
+        parts.append(
+            f"{element['name']} is a {element['metatype']} in the {element['model']} model "
+            f"({element['layer']} layer), declared at "
+            f"{element['sourceFile']}:{element['sourceLine']}."
+        )
+        if element.get("shortName"):
+            parts.append(f"Its short name is {element['shortName']}.")
     if element.get("doc"):
         parts.append(element["doc"])
     values = []

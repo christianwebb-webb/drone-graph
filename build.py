@@ -1,4 +1,4 @@
-"""Run the whole pipeline: parse -> project -> enrich.
+"""Run the whole pipeline: parse -> project -> enrich -> analogy.
 
     python build.py            # everything
     python build.py --reset    # drop the database first
@@ -19,7 +19,7 @@ import argparse
 import time
 
 from sysml import config
-from sysml.pipeline import enrich, parse, project
+from sysml.pipeline import analogy, enrich, parse, project
 
 
 def main() -> None:
@@ -39,6 +39,9 @@ def main() -> None:
     
     print("\n== enrich ==")
     enrich.main()
+
+    print("\n== analogy ==")
+    analogy.main()
     print(f"\ndone in {time.time() - started:.0f}s -- database {config.DB_NAME}")
 
 

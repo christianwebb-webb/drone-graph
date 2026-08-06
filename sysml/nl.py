@@ -56,15 +56,25 @@ MUTATION = re.compile(r"\b(INSERT|UPDATE|REPLACE|REMOVE|UPSERT|TRUNCATE)\b", re.
 
 # Passed to the retriever as `response_instructions`, which is its supported way to
 # shape an answer.
-ANSWER_RULES = """Answer from the retrieved context and nothing else.
+ANSWER_RULES = """You are answering questions about one specific set of SysML v2
+models, from the retrieved context and nothing else. The context is the model. Your
+own knowledge of Apollo, spacecraft or drones is not evidence and must not appear in
+the answer, even when it agrees with the context and even when it would fill an
+obvious gap.
 
+- Answer about *these* models, not about the subject in general. Name the elements
+  the context names, using their declared names, and give the `file:line` the
+  context shows for them. An answer that would read the same against any other
+  drone or spacecraft model has not used the context.
 - Synthesising across the context is expected. Grouping, comparing and summarising
   what is there -- including the community summaries -- is answering, not guessing.
   What is forbidden is a fact the context does not contain.
 - If the context genuinely lacks what was asked, say "the model does not say".
-  Never fall back on general knowledge about Apollo, spacecraft or drones.
-- A number must come from an attribute value in the context. If an attribute is an
-  expression rather than a value, say it is computed and give the expression.
+  Never fall back on general knowledge to cover it.
+- A number must come from an attribute value in the context, quoted with its unit
+  as the context gives it. If an attribute is an expression rather than a value, say
+  it is computed and give the expression. Do not supply a real-world figure for
+  something the model leaves unspecified.
 - If the context shows two facts that contradict each other, report the conflict
   rather than choosing one."""
 
@@ -117,10 +127,40 @@ class Answer:
     rows: list = field(default_factory=list)
     context: str = ""
     error: str | None = None
+    retrieved: str = ""
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    def evidence(self, chars: int = 700, find: str | None = None) -> None:
+        """Print a window onto what was retrieved, so the answer can be checked.
+
+        An answer alone cannot be told apart from something the model already knew.
+        Printing the context beside it makes the difference visible: the facts in
+        the answer are in the text below it, or they were invented. `find` moves the
+        window to the first mention of something, which is how a specific number in
+        an answer gets traced back to the text it came from.
+        """
+        if not self.context:
+            print("evidence  (none retrieved)")
+            return
+        body = re.sub(r"\n{2,}", "\n", self.context.strip())
+        start = 0
+        if find:
+            hit = body.find(find)
+            if hit < 0:
+                print(f"evidence  ({find!r} does not appear in the retrieved context)")
+                return
+            # Back up to a line start, so the window does not open mid-word.
+            start = body.rfind("\n", 0, max(0, hit - chars // 4)) + 1
+        window = body[start:start + chars]
+        where = f"at char {start:,}" if start else "from the start"
+        print(f"evidence  ({len(window):,} chars {where}, of {len(self.context):,} retrieved)")
+        for line in window.splitlines():
+            print(f"   {line}")
+        if start + chars < len(body):
+            print("   ...")
 
     def show(self, row_limit: int = 6) -> None:
         print(f"Q  {self.question}")
@@ -130,11 +170,18 @@ class Answer:
                 print(f"   {line}")
         if self.error:
             print(f"\n!! {self.error}")
+        # What the answer was built from. On the retrieval paths this is a summary
+        # of the search, and `rows` is the citation map -- which is a subset of
+        # what was read, not the whole of it. Printing only the citations made a
+        # retrieval that read thirty documents look like it had found three.
+        if self.retrieved:
+            print(f"\nretrieved  {self.retrieved}")
         if self.rows:
-            print(f"\nrows ({len(self.rows)}, first {min(row_limit, len(self.rows))})")
+            label = "cited" if self.retrieved else "rows"
+            print(f"\n{label} ({len(self.rows)}, first {min(row_limit, len(self.rows))})")
             for row in self.rows[:row_limit]:
                 print("   " + json.dumps(row, default=str)[:300])
-        elif not self.error:
+        elif not self.error and not self.retrieved:
             print("\nrows (0)")
         print(f"\nA  {self.answer}\n")
 
@@ -356,7 +403,41 @@ class Retriever:
         rows = [{"cite": key, "source": value.get("citable_url")}
                 for key, value in sorted(citations.items(), key=lambda kv: str(kv[0]))]
         context = meta.get("formatted_context") or result.get("formatted_context") or ""
-        return Answer(question, str(answer).strip(), rows=rows, context=str(context))
+        if not context:
+            # Only `local` reports a context blob. `global`'s evidence is the points
+            # its analyst pass distilled from the community reports; `unified` keeps
+            # the text of what it read in the citation map. Both are the retrieved
+            # text, just filed elsewhere.
+            context = "\n".join(f"- {p.get('answer', '')}"
+                                for p in meta.get("final_support_points") or [])
+        if not context:
+            context = "\n".join(str(v.get("content") or "").strip()
+                                for _, v in sorted(citations.items(), key=lambda kv: str(kv[0])))
+        return Answer(question, str(answer).strip(), rows=rows, context=str(context),
+                      retrieved=self._summarise(result, meta, str(context)))
+
+    @staticmethod
+    def _summarise(result: dict, meta: dict, context: str) -> str:
+        """One line naming what the search actually read.
+
+        Each scope reports itself differently: `global` counts the community reports
+        it summarised and the points it distilled from them, the other two count the
+        documents and edges they walked. Without this the only visible number is the
+        citation count, and a citation is a source the answer happens to quote --
+        not a measure of what was searched.
+        """
+        graph = meta.get("graph_metadata") or result.get("graph_metadata") or {}
+        docs = len(graph.get("documents") or [])
+        edges = len(graph.get("edges") or [])
+        points = len(meta.get("final_support_points") or [])
+        if points:
+            return f"{docs} community reports -> {points} points"
+        parts = [f"{docs} documents"]
+        if edges:
+            parts.append(f"{edges} edges")
+        if context:
+            parts.append(f"{len(context):,} chars of context")
+        return ", ".join(parts)
 
     def ask(self, question: str, scope: str = "local") -> Answer:
         return asyncio.run(self.ask_async(question, scope))
