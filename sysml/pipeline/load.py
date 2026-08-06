@@ -32,7 +32,7 @@ from .. import config
 from . import structure
 
 
-def importer():
+def importer(system: str):
     """graphrag_importer's writer, pointed at the local container.
 
     Two shims, both planted as module globals because that is what the import
@@ -71,10 +71,13 @@ def importer():
 
     config.openai_key()
     return writer.ImportGraphToADB(
-        path_to_files=str(config.KG),
+        path_to_files=str(config.kg(system)),
         arangodb_url=config.ARANGO_URL,
         db_name=config.DB_NAME,
-        import_number=0,
+        # In every document key the writer generates
+        # (graphrag/importer/import_graph_to_adb.py:391), which is what keeps two
+        # systems that use the same word from becoming one row.
+        import_number=config.import_number(system),
         project_name=config.PROJECT,
         # Communities are embedded so `global` can search them, and edges so a
         # question can be matched against the relations themselves.
@@ -102,15 +105,20 @@ async def load() -> dict:
     db = config.db(create=True)
     reset(db)
 
-    imp = importer()
-    await imp.initialize(config.token())
-    await imp.import_documents(config.ARTIFACTS.FULL_DOCS)
-    # Deliberately without the chunk-embedding file -- see `chunk_vectors`.
-    await imp.import_text_chunks(config.ARTIFACTS.TEXT_CHUNKS)
-    chunk_vectors(db, imp)
-    await imp.import_entities(config.ARTIFACTS.ENTITIES)
-    await imp.import_relationships(config.ARTIFACTS.RELATIONSHIPS)
-    await imp.import_community_reports(config.ARTIFACTS.COMMUNITY_REPORTS)
+    # One import per system, in SYSTEMS order so the import numbers are the ones
+    # `config.import_number` promises. Each reads its own workbench and writes into
+    # the same collections; the keys cannot collide because the number is in them.
+    imp = None
+    for system in config.SYSTEMS:
+        imp = importer(system)
+        await imp.initialize(config.token())
+        await imp.import_documents(config.ARTIFACTS.FULL_DOCS)
+        # Deliberately without the chunk-embedding file -- see `chunk_vectors`.
+        await imp.import_text_chunks(config.ARTIFACTS.TEXT_CHUNKS)
+        chunk_vectors(db, imp)
+        await imp.import_entities(config.ARTIFACTS.ENTITIES)
+        await imp.import_relationships(config.ARTIFACTS.RELATIONSHIPS)
+        await imp.import_community_reports(config.ARTIFACTS.COMMUNITY_REPORTS)
 
     label(db)
     # Before the indexes, not after: `structure` creates an entity for anything a

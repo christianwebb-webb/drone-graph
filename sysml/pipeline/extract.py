@@ -37,18 +37,22 @@ if (sys.stdout.encoding or "").lower() not in ("utf-8", "utf8"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def graphrag():
-    """The extraction pipeline, configured and pointed at out/kg.
+def graphrag(system: str):
+    """The extraction pipeline, configured and pointed at one system's workbench.
 
     `enable_chunk_embeddings` is on because the `unified` retriever searches the
     source chunks in parallel with the entity graph, and without vectors on the
     chunks that half of it has nothing to search.
 
+    A workbench per system is what keeps entity names from merging across two
+    unrelated vehicles -- the merge happens here, in the builder's own graph, long
+    before ArangoDB sees anything, so it is the only place it can be scoped.
+
     The LLM cache lives in the working directory, so a second run over unchanged
     files re-reads the answers instead of re-buying them.
     """
     config.openai_key()
-    config.KG.mkdir(parents=True, exist_ok=True)
+    config.kg(system).mkdir(parents=True, exist_ok=True)
     # corpus_graph and the builder both attach a stdout handler at import time,
     # which corrupts anything reading stdout. Keep the logs, move them to stderr.
     for name in ("arango-graphrag", "vectordb", "graphrag"):
@@ -59,7 +63,7 @@ def graphrag():
     from graphrag.graph_builder.builder.graphrag import GraphRAG
 
     return GraphRAG(
-        working_dir=str(config.KG),
+        working_dir=str(config.kg(system)),
         entity_types=config.KINDS,
         relationship_types=config.RELATIONS_ONTOLOGY,
         enable_strict_types=True,
@@ -67,10 +71,12 @@ def graphrag():
     )
 
 
-def sources() -> list[tuple[str, str]]:
-    """Every .sysml file under models/, as (path relative to models/, text)."""
-    return [(p.relative_to(config.MODELS).as_posix(), p.read_text(encoding="utf-8"))
-            for p in sorted(config.MODELS.rglob("*.sysml"))]
+def sources(system: str) -> list[tuple[str, str]]:
+    """One system's .sysml files, as (path relative to models/, text)."""
+    return [(rel, p.read_text(encoding="utf-8"))
+            for p, rel in ((p, p.relative_to(config.MODELS).as_posix())
+                           for p in sorted(config.MODELS.rglob("*.sysml")))
+            if config.system_of(rel) == system]
 
 
 def metadata(relative_path: str) -> dict:
@@ -87,32 +93,34 @@ def metadata(relative_path: str) -> dict:
     }
 
 
-async def run() -> dict:
-    kg = graphrag()
-    files = sources()
-    print(f"  {len(files)} files, {sum(len(t) for _, t in files):,} characters")
+async def run(system: str) -> dict:
+    kg = graphrag(system)
+    files = sources(system)
+    print(f"  {system}: {len(files)} files, {sum(len(t) for _, t in files):,} characters")
     await kg.ainsert([text for _, text in files],
                      [metadata(rel) for rel, _ in files])
-    return summary()
+    return summary(system)
 
 
-def summary() -> dict:
+def summary(system: str) -> dict:
     """Count what landed on the workbench, without loading the graph twice."""
     import networkx as nx
 
-    graph = nx.read_graphml(config.KG / config.ARTIFACTS.RELATIONSHIPS)
-    chunks = json.loads((config.KG / config.ARTIFACTS.TEXT_CHUNKS).read_text(encoding="utf-8"))
+    out = config.kg(system)
+    graph = nx.read_graphml(out / config.ARTIFACTS.RELATIONSHIPS)
+    chunks = json.loads((out / config.ARTIFACTS.TEXT_CHUNKS).read_text(encoding="utf-8"))
     reports = json.loads(
-        (config.KG / config.ARTIFACTS.COMMUNITY_REPORTS).read_text(encoding="utf-8"))
+        (out / config.ARTIFACTS.COMMUNITY_REPORTS).read_text(encoding="utf-8"))
     return {"chunks": len(chunks), "entities": graph.number_of_nodes(),
             "relations": graph.number_of_edges(), "communities": len(reports)}
 
 
 def main() -> None:
-    counts = asyncio.run(run())
-    print(f"  extracted into {config.KG}")
-    for name, n in counts.items():
-        print(f"  {n:>6}  {name}")
+    for system in config.SYSTEMS:
+        counts = asyncio.run(run(system))
+        print(f"  extracted into {config.kg(system)}")
+        for name, n in counts.items():
+            print(f"  {n:>6}  {name}")
 
 
 if __name__ == "__main__":
