@@ -213,11 +213,26 @@ class Aqlizer:
         os.environ.setdefault("CHAT_API_PROVIDER", "openai")
         try:
             import txt2aql.service  # noqa: F401
+            from txt2aql.read_only_chain import ReadOnlyArangoGraphQAChain
         except ImportError as exc:
             raise RuntimeError(
                 f"cannot import txt2aql ({exc}). Clone natural-language-service next "
                 "to this project and install its deps into this interpreter."
             ) from exc
+
+        # The read-only gate looks for its keywords with `if op in query.upper()`,
+        # a substring test, so a perfectly ordinary read is refused for containing
+        # the letters of a write. "What was the state at lunar orbit insertion"
+        # produces AQL mentioning INSERTION and is rejected as an INSERT. On a
+        # systems-engineering corpus that is not an edge case -- orbit insertion,
+        # part replacement, requirement updates. Matching on word boundaries keeps
+        # the gate and drops the false positives, and MUTATION below is still the
+        # one that actually decides whether a query runs.
+        def read_only(_self, aql_query: str):
+            found = MUTATION.search(aql_query or "")
+            return (False, found.group(0).upper()) if found else (True, None)
+
+        ReadOnlyArangoGraphQAChain._is_read_only_query = read_only
         logs_to_stderr("txt2aql")
 
     @property

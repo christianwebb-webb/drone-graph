@@ -177,6 +177,14 @@ def split_head(text: str) -> dict[str, Any]:
     # the declaration it applies to: `#Approved part x` declares a part.
     while tokens and (tokens[0] in MODIFIERS or tokens[0].startswith("#")):
         tokens.pop(0)
+    # A declaration can be introduced by the relationship it takes part in:
+    # `exhibit state apollo11Phases`, `perform action load`, `assert constraint c`.
+    # The keyword after the prefix is still what is being declared, so a bare word
+    # in front of one is dropped. `satisfy REQ by DESIGN` is untouched because
+    # `REQ` is not a keyword -- that is a relationship, not a declaration.
+    if (len(tokens) > 1 and tokens[0] not in KEYWORDS and tokens[1] in KEYWORDS
+            and tokens[0].isalpha()):
+        tokens.pop(0)
     if not tokens or tokens[0] not in KEYWORDS:
         return {}
     kind = tokens.pop(0)
@@ -318,7 +326,8 @@ def walk(relative_path: str, text: str, elements: dict, relations: list) -> None
         qualified = f"{owner['qualified']}::{head['name']}" if owner else head["name"]
         element = {
             "name": head["name"], "qualified": qualified, "kind": head["kind"],
-            "short": head["short"], "file": relative_path, "line": line,
+            "short": head["short"], "typed": head["typed"],
+            "specializes": head["specializes"], "file": relative_path, "line": line,
         }
         # An `attribute` with a value is not really an element of its own -- it is
         # a property of whatever declares it, which is how a rollup expects to
@@ -351,6 +360,51 @@ def walk(relative_path: str, text: str, elements: dict, relations: list) -> None
             stack.append(element)
 
 
+def name_elements(elements: list[dict]) -> None:
+    """Give every declaration a `display` that is unique within its model.
+
+    A declaration's identity is its qualified name -- the bare name is what it is
+    called, not what it is. Two elements can share a bare name and be entirely
+    different things: `spacecraft` is declared 21 times in the Apollo model, once
+    per mission snapshot, and `umbilicalPort` five times on five different parts.
+    Keyed on the bare name they become one row, which merges a rollup's subtrees,
+    overwrites one declaration's attributes with another's, and answers a question
+    about lunar orbit insertion with the command module's condition after recovery.
+
+    Uniqueness is bought as cheaply as possible: a name only one declaration claims
+    is left alone, so most elements keep the short name that reads well and that
+    search indexes. A contested one takes as many owner segments as it needs --
+    `TLI_CONTROL`, `LOI_CONTROL`. One segment settles almost all of them.
+    """
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for element in elements:
+        key = (config.model_of(element["file"]), element["name"].upper())
+        grouped.setdefault(key, []).append(element)
+
+    for (_, bare), group in grouped.items():
+        if len(group) == 1:
+            group[0]["display"] = bare
+            continue
+        remaining, depth = list(group), 1
+        while remaining and depth < 8:
+            by_suffix: dict[str, list[dict]] = {}
+            for element in remaining:
+                segments = element["qualified"].upper().split("::")
+                by_suffix.setdefault(
+                    "_".join(segments[max(0, len(segments) - depth - 1):]), []).append(element)
+            still = []
+            for suffix, members in by_suffix.items():
+                if len(members) == 1:
+                    members[0]["display"] = suffix
+                else:
+                    still.extend(members)
+            remaining, depth = still, depth + 1
+        # Same qualified name twice is the same element declared twice, not two
+        # elements: let them share a row, which is what the qualified name says.
+        for element in remaining:
+            element["display"] = element["qualified"].upper()
+
+
 def read() -> dict:
     """Every .sysml file under models/, as {elements, relations}."""
     elements: dict[str, dict] = {}
@@ -358,7 +412,9 @@ def read() -> dict:
     for path in sorted(config.MODELS.rglob("*.sysml")):
         walk(path.relative_to(config.MODELS).as_posix(),
              path.read_text(encoding="utf-8"), elements, relations)
-    return {"elements": list(elements.values()), "relations": relations}
+    ordered = list(elements.values())
+    name_elements(ordered)
+    return {"elements": ordered, "relations": relations}
 
 
 # --------------------------------------------------------------------- the apply
@@ -388,26 +444,134 @@ def index_of(db) -> dict[str, list[dict]]:
     return lookup
 
 
-def resolve(lookup: dict[str, list[dict]], reference: str, model: str,
-            same_model_only: bool = False) -> str | None:
-    """A declared name -> the _key of the entity for it, resolved within a model.
+def resolve(lookup: dict[str, list[dict]], reference: str, model: str) -> str | None:
+    """A name -> the _key of the entity extraction made for it, within a model.
 
-    Scoping by model is not a refinement, it is the difference between right and
-    wrong. `power` names five Apollo ports and two drone elements, so a global
-    name match binds an Apollo declaration to a drone requirement and invents a
-    relation between two vehicles that share nothing but a word.
-
-    `same_model_only` is set for relations, where a wrong edge is a false claim
-    about the model. It is left off when attaching attributes and provenance to an
-    element, where the fallback is the only candidate there is and the worst case
-    is a value on the wrong row of the same name.
+    Only ever consulted for a name no declaration contests, so at most one row can
+    be meant. A candidate outside the model is not a weaker match, it is a
+    different element that happens to share a word -- returning one put Apollo's
+    `engines = (engine1..engine5)` onto the drone's row, which the drone's own
+    declaration never says and which contradicts the S-IVB's single engine.
     """
     name = reference.upper()
     candidates = lookup.get(name) or lookup.get(name.split("::")[-1]) or []
     within = [c for c in candidates if model in c["models"]]
-    if within:
-        return within[0]["key"]
-    return None if same_model_only or not candidates else candidates[0]["key"]
+    return within[0]["key"] if within else None
+
+
+def declarations_of(elements: list[dict]) -> dict[str, dict[str, list[dict]]]:
+    """model -> every way a declaration can be referred to -> the declarations.
+
+    A reference in a file is written however the author found convenient: the full
+    qualified name, a dotted path (`performLunarMission.outbound.tli.control`), a
+    trailing fragment, or the bare name. Indexing every suffix of every qualified
+    name covers all four with one lookup, and `reference_of` picks between the hits.
+    """
+    index: dict[str, dict[str, list[dict]]] = {}
+    for element in elements:
+        model = index.setdefault(config.model_of(element["file"]), {})
+        segments = element["qualified"].upper().split("::")
+        for start in range(len(segments)):
+            model.setdefault("::".join(segments[start:]), []).append(element)
+    return index
+
+
+def reference_of(index: dict[str, dict[str, list[dict]]], reference: str, model: str,
+                 source: str = "") -> dict | None:
+    """A written reference -> the declaration it names, or None if it is ambiguous.
+
+    Where several declarations answer to the same reference, SysML's own scoping
+    decides: a name is looked for in the enclosing scope first, and a feature
+    nested inside a sibling is not visible at all. So the nearest declaration wins,
+    and among equally near ones the shallowest does -- a `LunarModuleDescentStage`
+    written in `TechnicalComponentsPackage` means the definition that package
+    declares, not the usage inside `ApolloLunarModule` and not one of the mission
+    snapshots that redeclare it. That is what keeps a containment rollup on the
+    static component tree instead of wandering into the timeline.
+    """
+    # `A.b.c` and `A::b::c` are the same path written two ways.
+    name = re.sub(r"\s*[.:]+\s*", "::", reference.strip().strip("'\"")).upper()
+    candidates = (index.get(model) or {}).get(name) or []
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    here = source.upper().split("::") if source else []
+
+    def nearness(element: dict) -> tuple[int, int]:
+        there = element["qualified"].upper().split("::")
+        shared = 0
+        for mine, theirs in zip(here, there):
+            if mine != theirs:
+                break
+            shared += 1
+        return -shared, len(there)
+
+    ranked = sorted(candidates, key=nearness)
+    # Still tied means the reference genuinely does not say which one, and
+    # guessing would invent a relation the file never states.
+    return ranked[0] if nearness(ranked[0]) != nearness(ranked[1]) else None
+
+
+def children_of(elements: list[dict]) -> dict[str, dict[tuple[str, str], dict]]:
+    """model -> (owner qualified name, child name) -> the declaration, both upper."""
+    index: dict[str, dict[tuple[str, str], dict]] = {}
+    for element in elements:
+        owner, _, name = element["qualified"].upper().rpartition("::")
+        if owner:
+            index.setdefault(config.model_of(element["file"]), {})[(owner, name)] = element
+    return index
+
+
+def scopes_of(index, element: dict, model: str, depth: int = 5) -> list[str]:
+    """Where a feature of `element` can be declared: its own body, the definition
+    that types it, and whatever that definition specializes.
+
+    Inheritance is not optional here. `launchVehicle : 'SA-506'` has no `stage1` of
+    its own -- `SA-506` is an individual of `SaturnV`, and the stages are declared
+    on `SaturnV`. Stopping at the type finds nothing.
+    """
+    seen: set[str] = set()
+    order: list[str] = []
+    frontier = [element]
+    while frontier and depth:
+        following = []
+        for current in frontier:
+            qualified = current["qualified"].upper()
+            if qualified in seen:
+                continue
+            seen.add(qualified)
+            order.append(qualified)
+            supers = ([current["typed"]] if current.get("typed") else []) \
+                + (current.get("specializes") or [])
+            for reference in supers:
+                found = reference_of(index, reference, model, current["qualified"])
+                if found:
+                    following.append(found)
+        frontier, depth = following, depth - 1
+    return order
+
+
+def follow_path(index, children, reference: str, model: str, source: str = "") -> dict | None:
+    """Resolve a dotted feature path like `performLunarMission.outbound.prep.load`.
+
+    A dotted path does not walk containment, it walks typing. `outbound` is typed
+    `ExecuteOutboundJourney`, and the `prep` after it is a feature of *that
+    definition*, declared nowhere near `outbound` itself.
+
+    Every `satisfy X by Y` in this corpus writes its design end as a path of this
+    shape, so without this none of them resolve.
+    """
+    segments = [s for s in re.split(r"[.]", reference.strip().strip("'\"")) if s]
+    if len(segments) < 2:
+        return None
+    current = reference_of(index, segments[0], model, source)
+    for segment in segments[1:]:
+        if not current:
+            return None
+        name = segment.upper()
+        current = next((children[model][(scope, name)]
+                        for scope in scopes_of(index, current, model)
+                        if (scope, name) in children.get(model, {})), None)
+    return current
 
 
 def alias_key(name: str) -> str:
@@ -442,7 +606,8 @@ def plan_merges(db, structure: dict, lookup: dict[str, list[dict]]) -> dict[str,
     claimed: dict[tuple[str, str], set[str]] = {}
     for element in structure["elements"]:
         model = config.model_of(element["file"])
-        canonical = resolve(lookup, element["qualified"], model)
+        canonical = (resolve(lookup, element["display"], model)
+                     if element["display"] == element["name"].upper() else None)
         if not canonical:
             continue
         declared.add(canonical)
@@ -543,12 +708,14 @@ def embed(texts: list[str]) -> list[list[float]]:
     return out
 
 
-def key_of(entity_name: str) -> str:
+def key_of(entity_name: str, import_number: int) -> str:
     """The importer's own key scheme, so a later re-import updates rather than
-    duplicates: farmhash of the name, then the import number."""
+    duplicates: farmhash of the name, then the import number. The number is not
+    decoration -- it is what stops two models that use the same word from writing
+    the same key."""
     import farmhash
 
-    return f"{farmhash.Fingerprint64(entity_name)}_0"
+    return f"{farmhash.Fingerprint64(entity_name)}_{import_number}"
 
 
 def apply(db, structure: dict | None = None, create_missing: bool = True) -> dict[str, int]:
@@ -581,7 +748,13 @@ def apply(db, structure: dict | None = None, create_missing: bool = True) -> dic
 
     updates, missing = [], []
     for element in structure["elements"]:
-        key = resolve(lookup, element["qualified"], config.model_of(element["file"]))
+        model = config.model_of(element["file"])
+        # An extraction row is only reused when the declaration is the sole claimant
+        # of its name. Where several declarations share one, extraction made a
+        # single fused row out of all of them and there is no way to say which it
+        # belongs to, so each declaration takes a row of its own instead.
+        key = (resolve(lookup, element["display"], model)
+               if element["display"] == element["name"].upper() else None)
         if key:
             row = {"_key": key, "source_file": element["file"], "source_line": element["line"]}
             if element.get("attributes"):
@@ -596,20 +769,24 @@ def apply(db, structure: dict | None = None, create_missing: bool = True) -> dic
     if create_missing and missing:
         vectors = embed([describe(e) for e in missing])
         for element, vector in zip(missing, vectors):
-            name = element["qualified"].upper()
-            models = [config.model_of(element["file"])]
+            name = element["display"]
+            model = config.model_of(element["file"])
+            number = config.import_number(model)
             created.append({
-                "_key": key_of(name), "entity_name": name,
+                "_key": key_of(name, number), "entity_name": name,
                 "entity_type": element["kind"], "description": describe(element),
-                config.EMBEDDING_FIELD: vector, "clusters": [], "import_number": 0,
-                "files": [element["file"]], "models": models,
+                config.EMBEDDING_FIELD: vector, "clusters": [], "import_number": number,
+                "files": [element["file"]], "models": [model],
                 "source_file": element["file"], "source_line": element["line"],
                 "short_name": element["short"] or None,
                 "attributes": element.get("attributes") or {}, "stated": True,
             })
-            entry = {"key": created[-1]["_key"], "models": models}
-            lookup.setdefault(name, []).append(entry)
-            lookup.setdefault(element["name"].upper(), []).append(entry)
+            # Only under the name it was given. Registering it under its bare name
+            # too made every created row a magnet for every other declaration that
+            # shares that word -- which is how `Drone_BaseArchitecture::Drone` came
+            # to be stamped with the line and the mass of a different declaration.
+            lookup.setdefault(name, []).append(
+                {"key": created[-1]["_key"], "models": [model]})
         for i in range(0, len(created), 500):
             coll.import_bulk(created[i:i + 500], on_duplicate="update")
 
@@ -631,14 +808,31 @@ def apply(db, structure: dict | None = None, create_missing: bool = True) -> dic
               UPDATE e WITH {{description: CONCAT(e.description, " Also written ",
                                                   e.short_name, ".")}} IN {config.ENTITIES}""")
 
+    # Both ends of every edge are resolved against the declarations, not against
+    # the extracted names: a reference in a file names something the file declares,
+    # and the declarations are the only index that knows which one. Anything that
+    # stays ambiguous after the enclosing scope is taken into account is dropped
+    # rather than guessed.
+    index = declarations_of(structure["elements"])
+    children = children_of(structure["elements"])
+
+    def find(reference: str, model: str, source: str) -> dict | None:
+        return (reference_of(index, reference, model, source)
+                or follow_path(index, children, reference, model, source))
+
+    keys = {}
+    for element in structure["elements"]:
+        model = config.model_of(element["file"])
+        keys[id(element)] = (resolve(lookup, element["display"], model)
+                             or key_of(element["display"], config.import_number(model)))
+
     edges, dropped = {}, 0
     for relation in structure["relations"]:
-        # Both ends inside the model that states the relation. No file here
-        # references another model, so an edge that leaves one is a name
-        # collision rather than a fact -- `power` alone would produce seven.
         model = config.model_of(relation["file"])
-        source = resolve(lookup, relation["from"], model, same_model_only=True)
-        target = resolve(lookup, relation["to"], model, same_model_only=True)
+        from_element = find(relation["from"], model, relation["from"])
+        to_element = find(relation["to"], model, relation["from"])
+        source = keys.get(id(from_element)) if from_element else None
+        target = keys.get(id(to_element)) if to_element else None
         if not source or not target or source == target:
             dropped += 1
             continue
@@ -668,6 +862,20 @@ def apply(db, structure: dict | None = None, create_missing: bool = True) -> dic
               FILTER r.type == "RELATED_TO" AND r._from == r._to
               REMOVE r IN {config.RELATIONS} COLLECT WITH COUNT INTO n RETURN n""")
 
+    # Containment, typing, specialisation and redefinition are not things a text
+    # discusses -- they are things a declaration states, and the lexer reads all of
+    # them. An inferred one is therefore not extra coverage, it is a guess at
+    # something already known, and the guesses are wrong in a particular way: they
+    # point backwards. `HARDWARECOMPONENT typedby SATURNVINSTRUMENTUNIT` inverts a
+    # specialisation, and a six-hop containment walk crossing one arrives somewhere
+    # the model never puts it. The LLM keeps the relations that live in prose --
+    # refines, dependson, performs -- and gives up the four it cannot see.
+    inverted = db.aql.execute(
+        f"""FOR r IN {config.RELATIONS}
+              FILTER r.type == "RELATED_TO" AND r.stated != true
+                 AND r.relationship_type IN ["owns", "typedby", "specializes", "redefines"]
+              REMOVE r IN {config.RELATIONS} COLLECT WITH COUNT INTO n RETURN n""")
+
     # Where extraction guessed a relation the syntax also states, the two edges
     # are one fact written twice, and anything grouping by relationship_type
     # counts it twice. The read one is kept: it carries the file and line.
@@ -685,7 +893,8 @@ def apply(db, structure: dict | None = None, create_missing: bool = True) -> dic
     return {"elements": len(structure["elements"]), "created": len(created),
             "with_attributes": sum(1 for e in structure["elements"] if e.get("attributes")),
             "merged": merged, "edges": len(rows), "dropped": dropped,
-            "superseded": next(iter(superseded), 0) + next(iter(reflexive), 0)}
+            "superseded": (next(iter(superseded), 0) + next(iter(reflexive), 0)
+                           + next(iter(inverted), 0))}
 
 
 def main(create_missing: bool = True) -> None:

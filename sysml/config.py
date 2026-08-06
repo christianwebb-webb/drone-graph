@@ -102,60 +102,37 @@ except ImportError as exc:  # pragma: no cover - a missing clone, not a code pat
 
 SIMILAR_TO = EDGE_LABEL_SIMILAR_TO
 
-# Which source tree each file belongs to, and the label used everywhere downstream.
-MODELS_INDEX = {
-    "apollo-11-sysml-v2": "apollo-11",
-    "DroneModelLogical.sysml": "drone-logical",
-    "Drone_BaseArchitecture.sysml": "drone-base",
-}
+# One model per top-level entry under models/: a directory is a model, and so is a
+# loose .sysml file. Derived rather than listed, so adding a model is dropping a
+# folder in rather than editing this file.
+#
+# The list is also the boundary that decides what may merge with what. Extraction
+# merges entities by name within a run, so two models extracted together share a
+# `Battery`; extracted apart they do not. Each model gets its own workbench and its
+# own `import_number`, which `_generate_key` puts in every document key
+# (graphrag/importer/import_graph_to_adb.py:391) so the same word in two models is
+# two rows. Correspondence between models is what the analogy layer is for, and it
+# says "resembles", not "is".
+MODEL_NAMES = tuple(sorted(
+    p.name if p.is_dir() else p.stem
+    for p in MODELS.iterdir() if p.is_dir() or p.suffix == ".sysml"
+))
 
 
 def model_of(relative_path: str) -> str:
-    for prefix, label in MODELS_INDEX.items():
-        if relative_path == prefix or relative_path.startswith(f"{prefix}/"):
-            return label
-    return "unknown"
+    head = relative_path.split("/")[0]
+    return head[: -len(".sysml")] if head.endswith(".sysml") else head
 
 
-# Which models describe one real-world system, and the boundary that decides what
-# may merge with what.
-#
-# Extraction merges entities by name within a run: two files that both talk about a
-# `Battery` produce one entity. Across the two drone files that is correct and
-# wanted -- they describe one vehicle, and `DRONE` and `BATTERY` genuinely are the
-# same thing in both. Across Apollo and the drone it is a name collision: Apollo's
-# `control` action and the drone's `Control` requirement became one row with two
-# source files and a provenance that was simply wrong.
-#
-# The fix is the mechanism the importer already has. Each system is extracted on
-# its own workbench, so names can only merge inside it, and imported under its own
-# `import_number` -- which `_generate_key` puts in every document key
-# (graphrag/importer/import_graph_to_adb.py:391), so the same name in two systems
-# is two rows. Cross-system correspondence is what the analogy layer is for, and it
-# says "resembles", not "is".
-SYSTEMS = {
-    "apollo": ("apollo-11",),
-    "drone": ("drone-logical", "drone-base"),
-}
+def import_number(model: str) -> int:
+    """A model's slot in every document key. Sorted, so it is stable across runs
+    and only shifts if a model is added or removed -- which needs a fresh build."""
+    return MODEL_NAMES.index(model)
 
 
-def system_of(relative_path: str) -> str:
-    model = model_of(relative_path)
-    for system, models in SYSTEMS.items():
-        if model in models:
-            return system
-    return "unknown"
-
-
-def import_number(system: str) -> int:
-    """A system's slot in every document key. Stable as long as SYSTEMS keeps its
-    order, which is why adding a system means appending to it, never inserting."""
-    return list(SYSTEMS).index(system)
-
-
-def kg(system: str) -> Path:
-    """One GraphRAG working directory per system: artifacts and LLM cache."""
-    return KG / system
+def kg(model: str) -> Path:
+    """One GraphRAG working directory per model: artifacts and LLM cache."""
+    return KG / model
 
 
 # --------------------------------------------------------------------- ontology

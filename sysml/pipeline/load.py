@@ -32,7 +32,7 @@ from .. import config
 from . import structure
 
 
-def importer(system: str):
+def importer(model: str):
     """graphrag_importer's writer, pointed at the local container.
 
     Two shims, both planted as module globals because that is what the import
@@ -71,13 +71,13 @@ def importer(system: str):
 
     config.openai_key()
     return writer.ImportGraphToADB(
-        path_to_files=str(config.kg(system)),
+        path_to_files=str(config.kg(model)),
         arangodb_url=config.ARANGO_URL,
         db_name=config.DB_NAME,
         # In every document key the writer generates
         # (graphrag/importer/import_graph_to_adb.py:391), which is what keeps two
-        # systems that use the same word from becoming one row.
-        import_number=config.import_number(system),
+        # models that use the same word from becoming one row.
+        import_number=config.import_number(model),
         project_name=config.PROJECT,
         # Communities are embedded so `global` can search them, and edges so a
         # question can be matched against the relations themselves.
@@ -105,12 +105,13 @@ async def load() -> dict:
     db = config.db(create=True)
     reset(db)
 
-    # One import per system, in SYSTEMS order so the import numbers are the ones
-    # `config.import_number` promises. Each reads its own workbench and writes into
-    # the same collections; the keys cannot collide because the number is in them.
+    # One import per model, in MODEL_NAMES order so the import numbers are the
+    # ones `config.import_number` promises. Each reads its own workbench and
+    # writes the same collections; keys cannot collide because the number is in
+    # them.
     imp = None
-    for system in config.SYSTEMS:
-        imp = importer(system)
+    for model in config.MODEL_NAMES:
+        imp = importer(model)
         await imp.initialize(config.token())
         await imp.import_documents(config.ARTIFACTS.FULL_DOCS)
         # Deliberately without the chunk-embedding file -- see `chunk_vectors`.

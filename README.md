@@ -50,7 +50,15 @@ behind, so a rerun can start anywhere.
 Reads every `.sysml` file under `models/` and hands the text to
 `graphrag_importer`'s `GraphRAG`, which chunks it, asks an LLM for the entities and
 the relations between them, clusters the result with Leiden and writes one report
-per cluster. The artifacts land in `out/kg`.
+per cluster.
+
+One model at a time, each on its own workbench under `out/kg/<model>`. Extraction
+merges entities by name within a run, so this is the boundary that decides what may
+merge: run together, Apollo's `control` action and the drone's `Control` requirement
+become one row. A model is a top-level entry under `models/` -- a directory, or a
+loose `.sysml` file -- derived rather than configured, so adding one is dropping a
+folder in. Each is imported under its own `import_number`, which the writer puts in
+every document key.
 
 **Why:** the alternative -- and what this project used to do -- is a hand-written
 SysML parser. That was 791 lines of grammar, and it could only ever report a
@@ -62,8 +70,9 @@ typed outside them is dropped rather than renamed.
 
 **Cost:** entity names come back upper-cased, and the LLM is unreliable about
 anything the syntax states mechanically -- on this corpus it produced 68 `owns`
-edges where the files state about seventeen hundred, found 99 of the 266 `satisfy`
-statements written down, and left `S-IC` with no relations at all. That is what
+edges where the files state about eighteen hundred, found 99 of the 273 `satisfy`
+statements written down, and left `S-IC` with no relations at all. Its `typedby`
+guesses point backwards. That is what
 `structure` exists to fix. Every LLM answer is cached in `out/kg`, so a second run
 over unchanged sources is free.
 
@@ -95,8 +104,28 @@ tree has no holes.
 **Why:** the numbers and the tree have to be exact, and an LLM is not. Without this,
 "sum the dry mass of the Saturn V from its stages" returns nothing -- not because
 the masses are missing but because there is no path from the vehicle to its stages
-to walk. With it the answer is 199,130 kg from seven contributors, and the four
-`...Cost` attributes on the mission add to $11bn.
+to walk. With it the answer is 188,650 kg from the four things the Saturn V
+declares -- S-IC, S-II, S-IVB and the instrument unit -- and the four `...Cost`
+attributes on the mission add to $11bn.
+
+**Identity is the qualified name.** A bare name is not unique -- SysML lets any
+number of declarations share one, and this corpus has 139 that are shared, covering
+390 declarations: `spacecraft` is declared 21 times, once per mission snapshot, and
+`power` is a feature on five different ports. Keyed on the bare name they become
+one row, and then a rollup walks into the wrong subtree, one declaration's
+attributes overwrite another's, and a question about lunar orbit insertion is
+answered with the command module's condition after it was recovered from the ocean.
+So a contested name is stored with as much of its owner as it takes to be unique --
+`MISSIONSYSTEMATLOI_SPACECRAFT`, `CONTROLPORT_POWER` -- and the three quarters of
+names that nothing contests keep the short form that reads and searches well.
+
+References are resolved the way SysML scopes them rather than by matching text: the
+nearest enclosing declaration wins, then the shallowest, and a dotted path like
+`performLunarMission.outbound.prep.load` is followed through typing and inheritance
+rather than containment, because that is what the dots mean. Anything still
+ambiguous is dropped instead of guessed. That is what lets all but one of the 273
+`satisfy` statements resolve, where matching on the last name alone got 209 and
+some of those were bound to the wrong element.
 
 It knows SysML v2's declaration grammar, not this corpus: any modifier or `#`
 metadata annotation, a keyword in `KEYWORDS`, optionally `case` and `def`, an
@@ -121,16 +150,25 @@ element has two written names -- `requirement def <'DE-REQ-1'> Power` is address
 as either -- and extraction keeps whichever the sentence it read happened to use,
 so the same requirement arrives twice, once as `POWER` and once as `DE-REQ-1`,
 each with a share of the edges. Only the declaration says they are one element, so
-only this step can: 171 duplicate rows are folded into the element they name, and
+only this step can: 127 duplicate rows are folded into the element they name, and
 their edges moved across. A row is only a duplicate if no declaration resolves to
 it -- Apollo's `requirement 'flr-R001' : PropellantLoadingRequirement` is a real
 usage whose name happens to be another element's short name, and it survives.
 
-The same reasoning applies to the edges. Where extraction guessed a relation the
-syntax also states, the guess is dropped and the read one kept -- it carries the
-file and line. So is any edge from an element to itself: 12 of those were
-`satisfies`, enough to report twelve requirements as met by themselves and leave
-them out of the list of what nothing satisfies.
+The same reasoning applies to the edges, and more strongly. `owns`, `typedby`,
+`specializes` and `redefines` are not things a text discusses, they are things a
+declaration states, and the lexer reads all of them -- so an inferred one is a
+guess at something already known. They are dropped. The guesses were wrong in a
+particular way: they point backwards. `HARDWARECOMPONENT typedby
+SATURNVINSTRUMENTUNIT` inverts a specialisation, and a six-hop containment walk
+crossing one arrives at another vehicle's parts. Extraction keeps the relations
+that live in prose -- `refines`, `dependson`, `performs`, and the `satisfies` it
+infers rather than reads.
+
+Also dropped: an edge duplicating one the syntax states, and any edge from an
+element to itself. Twelve of the latter were `satisfies`, enough to report twelve
+requirements as met by themselves and leave them out of the list of what nothing
+satisfies.
 
 Edges it writes are `RELATED_TO` with the relation in `relationship_type`, the same
 shape extraction writes, so nothing downstream has to know which pass produced an

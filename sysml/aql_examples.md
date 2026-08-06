@@ -17,7 +17,7 @@ attribute values, containment and typing -- because those must be exact. Fields
 from the second pass are marked *(stated)* below and are always trustworthy;
 everything else is the LLM's reading.
 
-`sysml_Entities` -- one element each, 2751 of them.
+`sysml_Entities` -- one element each, 3137 of them.
   `entity_name` the element's name **in upper case**: `SATURNV`, `HLR-R060`,
      `COMMAND/SERVICE MODULE`. Extraction upper-cases every name, so a comparison
      against a mixed-case literal matches nothing.
@@ -31,7 +31,7 @@ everything else is the LLM's reading.
      the source text.
   `attributes` *(stated)* a MAP of attribute name -> `{value, unit}` for a number
      the file assigns, or `{expression}` when the file assigns a formula rather
-     than a value. 162 elements carry one. Units are reduced to the bare symbol,
+     than a value. 176 elements carry one. Units are reduced to the bare symbol,
      so `[kg]`, `[SI::kg]` and `['kg']` all read `kg`. Common names: `dryMass`,
      `propellantMass`, `powerLoad`, `failureRate`, `mass`, and the four
      `...Cost` attributes on `APOLLO11MISSION`.
@@ -41,11 +41,13 @@ everything else is the LLM's reading.
      whichever of its two names is used, so match on `short_name` -- never expect
      `entity_name == 'DE-REQ-1'`.
   `source_file` / `source_line` *(stated)* where the element is declared. Present
-     on the 1531 elements the lexer matched; null for one the LLM named but no
+     on the 1851 elements the lexer matched; null for one the LLM named but no
      declaration does.
   `files` a LIST of the source files the element was found in. An element found in
      two files has two entries.
-  `models` a LIST, each one of `apollo-11`, `drone-logical`, `drone-base`.
+  `models` a LIST. One name per top-level entry under `models/`, here
+     `apollo-11-sysml-v2`, `DroneModelLogical` and `Drone_BaseArchitecture`.
+     Almost every element belongs to exactly one.
   `clusters` the Leiden cluster assignments backing the community layer.
 
 `sysml_Documents` -- one per source file, 30 of them.
@@ -55,7 +57,7 @@ everything else is the LLM's reading.
 `sysml_Chunks` -- 114 windows of source text.
   `content`, `tokens`, `chunk_order_index`, plus `files` and `models`.
 
-`sysml_Communities` -- 138 Leiden clusters with an LLM-written report.
+`sysml_Communities` -- 144 Leiden clusters with an LLM-written report.
   `title`, `report_string`, `level` (0, 1 or 2), `occurrence`, `sub_communities`,
   and `report_json` with `title`, `summary`, `findings`, `rating`,
   `rating_explanation`.
@@ -98,7 +100,7 @@ a name, a relation) and let that select the rows.
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER 'drone-logical' IN e.models
+  FILTER 'DroneModelLogical' IN e.models
   FILTER e.entity_type == 'part'
   RETURN {name: e.entity_name, files: e.files}
 ```
@@ -130,6 +132,27 @@ FOR r IN sysml_Relations
     RETURN {model: m, source: read ? "read from the syntax" : "inferred by the LLM",
             relations: n}
 ```
+
+A bare name is not unique. SysML lets any number of declarations share one -- a
+feature called `power` on several ports, a part called `spacecraft` in each
+snapshot of a timeline -- so where that happens each declaration is stored under a
+name prefixed with enough of its owner to tell them apart: `CONTROLPORT_POWER`,
+`MISSIONSYSTEMATLOI_SPACECRAFT`. The unprefixed name may also exist as a row, but
+that one is the concept extraction read in the prose, and it has no `source_file`.
+
+So a question about a *declared* element should match the end of the name and take
+the declared ones, rather than testing the bare name for equality:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.source_file != null
+  FILTER e.entity_name == UPPER(@wanted) OR LIKE(e.entity_name, CONCAT("%_", UPPER(@wanted)))
+  RETURN {name: e.entity_name, owner_hint: e.entity_name,
+          at: CONCAT(e.source_file, ":", e.source_line)}
+```
+
+Reaching one through the containment tree is better still when the question names
+a context ("the spacecraft at LOI"): start at the context and walk `owns`.
 
 An identifier like `DE-REQ-1`, `CLR-R083` or `FLR-R046` is a `short_name`, not an
 `entity_name`. The element is one row, stored under its written name, so look the
@@ -201,6 +224,60 @@ FOR v, r IN 1..1 ANY e sysml_Relations
 Picking one direction because the wording sounds one-way is the most common way to
 get an empty result from a question that has an answer.
 
+## A multi-hop walk must constrain EVERY edge, not the last one
+
+`FOR v, e IN 1..6 OUTBOUND x edges FILTER e.relationship_type == 'owns'` does not
+do what it looks like. `e` is the **last** edge of each path, so the filter admits
+any path whose final step is `owns` no matter what the earlier steps were. Over six
+hops that reaches most of the graph.
+
+To constrain the whole path, filter the path:
+
+```aql
+FOR v, e, p IN 1..6 OUTBOUND @start sysml_Relations
+  OPTIONS {uniqueVertices: "path"}
+  FILTER p.edges[*].relationship_type ALL IN ["owns", "typedby"]
+  RETURN DISTINCT v
+```
+
+A traversal starting at `1` excludes the element you started from. When the question
+is about *those elements themselves* -- "give each stage's dry mass" -- do not
+traverse at all, just read their attributes. Traverse only when the question is
+about what they contain, and use `0..N` when it is about both.
+
+This matters most for containment rollups. A part's subtree is reached by `owns`
+to each usage and `typedby` from a usage to the definition that carries the values
+-- and by nothing else. Let one `specializes` in and the walk climbs into an
+abstract supertype, then back down into every other thing that specializes it,
+which is a different vehicle's parts.
+
+## A question about a moment in time starts at the occurrence, not the part
+
+SysML models change over time with `snapshot` and `timeslice` declarations, each
+redeclaring the parts it is about and giving them the values they hold at that
+moment. The values are therefore on elements *inside* the snapshot, not on the
+static component -- so start at the snapshot and walk down, collecting whatever
+carries attributes:
+
+Names are declaration identifiers with the case flattened, so they carry no
+spaces: the snapshot for lunar orbit insertion is `ATLOI`, not
+`AT LUNAR ORBIT INSERTION`. A phrase taken from the question will not match.
+Strip the spaces out of it, and match an abbreviation too when the model uses one:
+
+```aql
+FOR occurrence IN sysml_Entities
+  FILTER occurrence.entity_type IN ["snapshot", "timeslice"]
+  FILTER CONTAINS(occurrence.entity_name, UPPER(SUBSTITUTE(@moment, " ", "")))
+  FOR v, e, p IN 1..5 OUTBOUND occurrence sysml_Relations
+    FILTER p.edges[*].relationship_type ALL IN ["owns", "redefines", "typedby"]
+    FILTER LENGTH(ATTRIBUTES(v.attributes)) > 0
+    RETURN DISTINCT {element: v.entity_name, values: v.attributes,
+                     at: CONCAT(v.source_file, ":", v.source_line)}
+```
+
+Reading the static part instead answers with whatever the model says in general,
+which is a different question and usually a different number.
+
 ## "How many" means COUNT, not a list
 
 The result set is capped, so a query that returns one row per match and leaves the
@@ -211,7 +288,7 @@ number from the whole set rather than from the sample:
 ```aql
 LET unsatisfied = (
   FOR e IN sysml_Entities
-    FILTER e.entity_type == 'requirement' AND 'apollo-11' IN e.models
+    FILTER e.entity_type == 'requirement' AND 'apollo-11-sysml-v2' IN e.models
     FILTER LENGTH(FOR r IN sysml_Relations
              FILTER r._to == e._id AND r.relationship_type == 'satisfies'
              RETURN 1) == 0
@@ -224,7 +301,7 @@ So "which requirements does nothing satisfy" looks for requirements with no
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.entity_type == 'requirement' AND 'drone-logical' IN e.models
+  FILTER e.entity_type == 'requirement' AND 'DroneModelLogical' IN e.models
   LET satisfied = LENGTH(
     FOR r IN sysml_Relations
       FILTER r._to == e._id AND r.relationship_type == 'satisfies'
@@ -270,7 +347,7 @@ Count the elements of each kind in one model:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER 'apollo-11' IN e.models
+  FILTER 'apollo-11-sysml-v2' IN e.models
   COLLECT type = e.entity_type WITH COUNT INTO n
   SORT n DESC LIMIT 10
   RETURN {type, n}
@@ -405,7 +482,7 @@ question, because it names what the smaller model does not cover:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER 'drone-logical' IN e.models AND e.entity_type == 'part'
+  FILTER 'DroneModelLogical' IN e.models AND e.entity_type == 'part'
   LET analogues = LENGTH(
     FOR v, r IN 1..1 ANY e sysml_Relations
       FILTER r.type == 'SIMILAR_TO' RETURN 1)
