@@ -39,14 +39,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import requests
 from arango import ArangoClient
 
 from . import config
-from .pipeline.enrich import embed_query
 
 SERVICE_REPO = config.SERVICE_REPO
-RETRIEVER_REPO = config.ROOT.parent / "graphrag_retrievers"
+RETRIEVER_REPO = config.RETRIEVER_REPO
 OPENAI_URL = "https://api.openai.com/v1"
 
 # The service's read-only check (WRITE_OPERATIONS) does not include TRUNCATE, so a
@@ -63,28 +61,35 @@ the answer, even when it agrees with the context and even when it would fill an
 obvious gap.
 
 - Answer about *these* models, not about the subject in general. Name the elements
-  the context names, using their declared names, and give the `file:line` the
-  context shows for them. An answer that would read the same against any other
-  drone or spacecraft model has not used the context.
+  the context names, using the names the context gives them, and say which source
+  file each came from where the context shows one. An answer that would read the
+  same against any other drone or spacecraft model has not used the context.
 - Synthesising across the context is expected. Grouping, comparing and summarising
   what is there -- including the community summaries -- is answering, not guessing.
   What is forbidden is a fact the context does not contain.
 - If the context genuinely lacks what was asked, say "the model does not say".
   Never fall back on general knowledge to cover it.
-- A number must come from an attribute value in the context, quoted with its unit
-  as the context gives it. If an attribute is an expression rather than a value, say
-  it is computed and give the expression. Do not supply a real-world figure for
-  something the model leaves unspecified.
+- A number must appear in the context, quoted with its unit as the context gives
+  it. Do not supply a real-world figure for something the context leaves
+  unspecified, and do not compute a total from figures the context does not state.
 - If the context shows two facts that contradict each other, report the conflict
   rather than choosing one."""
 
 
-def token() -> str:
-    """A database JWT. Both services authenticate with one rather than a password."""
-    r = requests.post(f"{config.ARANGO_URL}/_open/auth", timeout=15,
-                      json={"username": config.ARANGO_USER, "password": config.ARANGO_PASS})
-    r.raise_for_status()
-    return r.json()["jwt"]
+token = config.token
+
+
+def embed_query(text: str) -> list[float]:
+    """A query vector, made the way the stored ones were.
+
+    The extraction half embeds with `openai_embedding`, which calls
+    text-embedding-3-small with no `dimensions` argument. A query embedded any
+    other way is not in the same space as the rows it is compared against.
+    """
+    from openai import OpenAI
+
+    return OpenAI(api_key=config.openai_key()).embeddings.create(
+        model=config.EMBED_MODEL, input=[text]).data[0].embedding
 
 
 def logs_to_stderr(*names: str) -> None:
@@ -255,8 +260,8 @@ class Aqlizer:
             input_variables=["adb_schema", "user_input", "aql_query", "aql_result"],
             template=AQL_QA_TEMPLATE + (
                 "\nWrite the Summary in English.\n"
-                "If a row carries source_file and source_line, cite them as "
-                "(file:line) next to the fact they support.\n"
+                "If a row carries `files` or `models`, name them in brackets next "
+                "to the fact they support.\n"
                 "If the AQL Result is empty, say the query returned no rows. Do not "
                 "state that the model contains no such thing.\n"))
 
@@ -325,6 +330,7 @@ class Retriever:
             import retrievers.unified_retriever.unified_retriever as unified
             import retrievers.utils.auth as auth
             import retrievers.utils.metadata_helpers as metadata
+            import retrievers.utils.retriever_config as config_module
         except ImportError as exc:
             raise RuntimeError(
                 f"cannot import retrievers ({exc}). Clone graphrag_retrievers next "
@@ -348,6 +354,17 @@ class Retriever:
         auth._initialize_database_connection = open_database
         auth.is_valid_token = token_valid
         metadata.update_service_status = no_status
+
+        # `global` drops any community whose report embedding is less similar to
+        # the question than this, to skip the map-reduce on an off-topic query.
+        # The default of 0.45 is unreachable here: the reports the extraction step
+        # writes are a page of markdown each, and the cosine between a page and a
+        # one-line question does not get that high. Measured on this graph, an
+        # on-topic question tops out at 0.33-0.38 and an off-topic one
+        # ("a recipe for sourdough bread") at 0.05-0.07, so 0.25 sits in the gap
+        # and still throws out what the threshold exists to throw out. Left at
+        # 0.45 every global question answers "No relevant information found."
+        config_module.CONFIG.global_.global_min_community_similarity = 0.25
         # Each retriever imports these by name, so the shim has to be planted in
         # every module that will call one -- `unified` mid-query, when it renews.
         for module in (local, global_ng, unified, service):
@@ -456,7 +473,7 @@ FOR r IN {config.RELATIONS}
   SORT score DESC
   LIMIT @k
   RETURN {{description: r.description, relation: r.relationship_type,
-           at: CONCAT(r.source_file, ':', r.source_line), score}}"""
+           at: DOCUMENT(r._from).files, score}}"""
 
 
 def search_relations(db, question: str, k: int = 8, relation: str | None = None,

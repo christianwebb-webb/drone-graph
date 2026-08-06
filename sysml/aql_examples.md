@@ -10,367 +10,258 @@ Everything below was run against the graph before being written down.
 
 ## What the collections hold
 
-The corpus is three SysML v2 models projected into the graphrag_importer schema.
+Three SysML v2 models, read by graphrag_importer's extraction pipeline and written
+by its own ArangoDB writer. Every field below is one the importer writes, except
+`files` and `models`, which the load step adds.
 
-`sysml_Entities` -- one SysML element each.
-  `entity_name` full qualified name, e.g. `TechnicalComponentsPackage::SaturnV`
-  `name` the last segment; `short_name` the `<'HLR-R001'>` alias, or null
-  `entity_type` the SysML metatype: `RequirementUsage`, `RequirementDefinition`,
-     `PartUsage`, `PartDefinition`, `ActionUsage`, `ActionDefinition`, `StateUsage`,
-     `StateDefinition`, `AttributeUsage`, `Package`, `LibraryStub`, ...
-     There is no metatype called `Requirement`, `Part` or `Function`.
-  `model` one of `apollo-11`, `drone-logical`, `drone-base`
-  `layer` the source folder: `Requirements`, `Technical`, `Logical`, `Function`,
-     `Purpose`, `Program`, `Execution`, `Analysis`, `CoSMA`, `Drone`, `Library`
-  `source_file` / `source_line` where it is declared -- always return these
-  `doc` the authored documentation text
-  `attributes` a MAP of name -> `{value, unit, raw}`; a computed attribute has
-     `{expression: "..."}` and no `value`
-  `constraints` a LIST of constraint strings
-  `is_variation` / `is_variant` variation points and their alternatives
-  `is_library` true for a name referenced by the model but declared outside it
+`sysml_Entities` -- one extracted element each, 2503 of them.
+  `entity_name` the element's name **in upper case**: `SATURNV`, `HLR-R060`,
+     `COMMAND/SERVICE MODULE`. Extraction upper-cases every name, so a comparison
+     against a mixed-case literal matches nothing.
+  `entity_type` one of the 27 SysML kinds, **lower case**: `requirement`, `part`,
+     `action`, `attribute`, `package`, `state`, `port`, `item`, `constraint`,
+     `calc`, `analysis`, `connection`, `interface`, `view`, `viewpoint`,
+     `enumeration`, `concern`, `flow`, `allocation`, `event`, `metadata`,
+     `usecase`, `rendering`, `verification`, `snapshot`, `timeslice`, `occurrence`.
+     There is no type called `Function`, `RequirementUsage` or `PartDefinition`.
+  `description` prose describing the element, written by the extraction step from
+     the source text. Numbers, units and rationale live in here as words -- there
+     is no separate attributes map.
+  `files` a LIST of the source files the element was found in. An element found in
+     two files has two entries.
+  `models` a LIST, each one of `apollo-11`, `drone-logical`, `drone-base`.
+  `clusters` the Leiden cluster assignments backing the community layer.
 
-ONTOLOGY (3 of 3): the two lists below -- the entity types and the SysML relations --
-are what a query has to filter on, written out for the model that generates the AQL.
-They restate what parse.py recognises and what project.py phrases, so all three have
-to agree; nothing checks that they do.
+`sysml_Documents` -- one per source file, 30 of them.
+  `file_name` e.g. `apollo-11-sysml-v2/Requirements/TechnicalRequirementsPackage.sysml`
+  `citable_url`, `file_ids`, `content` (the whole file), plus `files` and `models`.
+
+`sysml_Chunks` -- 114 windows of source text.
+  `content`, `tokens`, `chunk_order_index`, plus `files` and `models`.
+
+`sysml_Communities` -- 138 Leiden clusters with an LLM-written report.
+  `title`, `report_string`, `level` (0, 1 or 2), `occurrence`, `sub_communities`,
+  and `report_json` with `title`, `summary`, `findings`, `rating`,
+  `rating_explanation`.
 
 `sysml_Relations` is the edge collection and holds every edge kind.
   `type` is the importer's own closed vocabulary:
-     `RELATED_TO`, `MENTIONED_IN`, `PART_OF`, `IN_COMMUNITY`, `SUB_COMMUNITY_OF`
-  `relationship_type` on a `RELATED_TO` edge is the **authored SysML relation**:
-     `owns`, `typedBy`, `specializes`, `redefines`, `satisfies`, `refines`,
-     `derives`, `performs`, `subject`, `exhibits`, `connects`, `transitionsTo`,
-     `variantOf`, `valueRef`, `imports`, `sliceOf`
+     `RELATED_TO`, `MENTIONED_IN`, `PART_OF`, `IN_COMMUNITY`, `SUB_COMMUNITY_OF`,
+     plus `SIMILAR_TO` for the analogy layer.
+  `relationship_type` on a `RELATED_TO` edge is the SysML relation, **lower case**:
+     `refines`, `satisfies`, `typedby`, `imports`, `dependson`, `owns`, `performs`,
+     `connects`, `exhibits`, `transitionsto`, `sliceof`, `specializes`,
+     `variantof`, `derives`, `subject`, `valueref`, `redefines`.
+     Note `typedby`, `transitionsto`, `dependson` and `variantof` have no capital
+     letter in the middle -- they are stored lower-cased.
   Filtering `type == 'RELATED_TO'` alone gives every SysML relation mixed together.
   A question about a specific relation must also filter `relationship_type`.
   The structural edges have no `relationship_type`, so grouping by it counts SysML
   relations only. Group by `type` to count the structural edges as well.
 
-Names are stored exactly as the model declares them and matching is case-sensitive.
-`Apollo11Mission`, `SaturnV` and `forestFireObservationDrone` will not match a
-lower-cased literal. When the question names a specific element but the case is
-uncertain, compare with `LOWER(e.name) == LOWER(@wanted)`.
+## The two things most likely to go wrong
 
-That is for an exact identifier. A vague or plural question -- *"tell me about
-engines"*, *"anything to do with batteries"* -- is not naming one element and must
-not be turned into an equality test, which will match nothing. Use containment and
-search the description too:
+**Case.** Names are upper case, types are lower case. Compare a name the model
+supplies with `UPPER(@wanted)`, or use `CONTAINS(e.entity_name, UPPER(@wanted))`.
+
+**`files` and `models` are lists, not strings.** Use `IN`:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER CONTAINS(LOWER(e.entity_name), "engine")
+  FILTER 'drone-logical' IN e.models
+  FILTER e.entity_type == 'part'
+  RETURN {name: e.entity_name, files: e.files}
+```
+
+A vague or plural question -- *"tell me about engines"*, *"anything to do with
+batteries"* -- is not naming one element and must not be turned into an equality
+test. Use containment, and search the description as well as the name:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER CONTAINS(e.entity_name, "ENGINE")
       OR CONTAINS(LOWER(e.description), "engine")
   LIMIT 25
-  RETURN {entity_name: e.entity_name, entity_type: e.entity_type,
-          at: CONCAT(e.source_file, ":", e.source_line)}
+  RETURN {name: e.entity_name, type: e.entity_type, files: e.files,
+          description: e.description}
 ```
 
-`attributes` is a **map**, not a list, so `e.attributes[*].unit` does not iterate it.
-To filter or list attributes across elements, expand the map with `ATTRIBUTES()` and
-index back into it:
+Numbers are in the prose, not in a structured field. A question about a value has
+to return the description and let the summary read it out; do not try to arrive at
+a total by arithmetic over fields that do not exist:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.attributes != null
-  FOR attrName IN ATTRIBUTES(e.attributes)
-    LET a = e.attributes[attrName]
-    FILTER a.unit == "kg" AND a.value != null
-    SORT a.value DESC
-    RETURN {element: e.entity_name, attribute: attrName, value: a.value, unit: a.unit,
-            at: CONCAT(e.source_file, ":", e.source_line)}
+  FILTER CONTAINS(LOWER(e.description), "dry mass")
+  LIMIT 15
+  RETURN {name: e.entity_name, files: e.files, description: e.description}
 ```
 
-`sysml_Chunks` source text windows (`content`, `file_name`, `start_line`, `end_line`).
-`sysml_Documents` one per `.sysml` file (`file_name`, `file_ids`).
-`sysml_Communities` clusters with a generated `report_string`, `level` 0 or 1.
+## Directions
 
-## Directions that are easy to get backwards
+The edge always points from the thing that acts to the thing acted on.
 
-`satisfy R by S` is stored as an edge **from the satisfier to the requirement**.
-So the satisfiers of a requirement are its INBOUND `satisfies` edges, and a
-requirement nothing satisfies is one with no inbound `satisfies` edge.
+  `A satisfies B` -- A is the design element, B is the requirement it meets.
+  `A refines B` -- A is the more detailed statement, B the one being refined.
+  `A performs B` -- A is the part, B the action.
+  `A owns B` -- A is the container, B the contained.
+  `A typedby B` -- A is the usage, B is the definition typing it.
 
-`owns` runs from container to contained. So to ask *"is this element inside
-SaturnV?"* the hop is INBOUND `owns` from the element, or OUTBOUND from SaturnV.
-Going OUTBOUND from the element reaches what it contains, not what contains it.
-
-`typedBy` and `specializes` run from the usage to the type it is declared against.
-
-**A definition and its usages often differ only in the first letter.**
-`AstronautSafety` is the definition and `astronautSafety` is a usage of it;
-`SaturnV` is a definition and `saturnV` a usage. They are different documents with
-different edges. Traceability -- `satisfies`, `refines`, `performs`, `subject` --
-is almost always authored on the **definition**, and attribute values are always on
-the definition. So when a question names something in CamelCase, match it exactly;
-do not silently lower-case the first letter. If which one is meant is genuinely
-unclear, match both with `LOWER(e.name) == LOWER(@wanted)` and return whichever has
-the edges.
+So "which requirements does nothing satisfy" looks for requirements with no
+**incoming** `satisfies` edge:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER LOWER(e.name) == LOWER("AstronautSafety")
-  LET refiners = (
-    FOR x, edge IN 1..1 INBOUND e sysml_Relations
-      FILTER edge.relationship_type == "refines"
-      RETURN {name: x.entity_name, at: CONCAT(x.source_file, ":", x.source_line)})
-  FILTER LENGTH(refiners) > 0
-  RETURN {matched: e.entity_name, entity_type: e.entity_type, refiners}
+  FILTER e.entity_type == 'requirement' AND 'drone-logical' IN e.models
+  LET satisfied = LENGTH(
+    FOR r IN sysml_Relations
+      FILTER r._to == e._id AND r.relationship_type == 'satisfies'
+      RETURN 1)
+  FILTER satisfied == 0
+  RETURN {requirement: e.entity_name, files: e.files}
 ```
 
 ## Examples
 
-Find an element by name or short name. SysML names are CamelCase and never spaced.
+Count the elements of each kind in one model:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.name == "SaturnV" OR e.short_name == "SaturnV"
-  RETURN {entity_name: e.entity_name, entity_type: e.entity_type,
-          at: CONCAT(e.source_file, ":", e.source_line)}
+  FILTER 'apollo-11' IN e.models
+  COLLECT type = e.entity_type WITH COUNT INTO n
+  SORT n DESC LIMIT 10
+  RETURN {type, n}
 ```
 
-What satisfies a requirement -- inbound `satisfies`.
-
-```aql
-FOR e IN sysml_Entities
-  FILTER e.short_name == "HLR-R001"
-  FOR s, edge IN 1..1 INBOUND e sysml_Relations
-    FILTER edge.type == "RELATED_TO" AND edge.relationship_type == "satisfies"
-    RETURN {satisfier: s.entity_name, at: CONCAT(s.source_file, ":", s.source_line)}
-```
-
-Requirements that nothing satisfies -- the gap query.
-
-```aql
-FOR e IN sysml_Entities
-  FILTER e.entity_type IN ["RequirementUsage", "RequirementDefinition"]
-  FILTER e.model == "apollo-11"
-  LET satisfiers = LENGTH(
-    FOR r IN sysml_Relations
-      FILTER r._to == e._id AND r.relationship_type == "satisfies"
-      LIMIT 1 RETURN 1)
-  FILTER satisfiers == 0
-  RETURN {entity_name: e.entity_name,
-          at: CONCAT(e.source_file, ":", e.source_line)}
-```
-
-Count relations by their authored SysML type.
+What satisfies what, with the sentence the extraction wrote for the edge:
 
 ```aql
 FOR r IN sysml_Relations
-  FILTER r.type == "RELATED_TO"
-  COLLECT relation = r.relationship_type WITH COUNT INTO n
-  SORT n DESC
-  RETURN {relation, count: n}
+  FILTER r.relationship_type == 'satisfies'
+  LET a = DOCUMENT(r._from), b = DOCUMENT(r._to)
+  FILTER a != null AND b != null
+  LIMIT 20
+  RETURN {satisfier: a.entity_name, requirement: b.entity_name,
+          how: r.description, files: a.files}
 ```
 
-"How many ..." wants one number. Aggregate in the query; do not return the matching
-documents and leave the caller to count rows. `RETURN COUNT(e)` inside a `FOR` is
-not a count of the matches -- it counts the attributes of one document.
+Everything one named element is attached to, in both directions:
+
+```aql
+LET e = FIRST(FOR x IN sysml_Entities
+               FILTER x.entity_name == UPPER(@name) RETURN x)
+FOR v, r IN 1..1 ANY e sysml_Relations
+  FILTER r.type == 'RELATED_TO'
+  RETURN {relation: r.relationship_type, other: v.entity_name,
+          direction: r._from == e._id ? 'outgoing' : 'incoming',
+          description: r.description}
+```
+
+Which elements appear in more than one source file -- extraction merges elements by
+name, so this finds the concepts that several files talk about:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.model == "apollo-11" AND e.entity_type == "RequirementDefinition"
-  COLLECT WITH COUNT INTO n
-  RETURN n
+  FILTER LENGTH(e.files) > 1
+  SORT LENGTH(e.files) DESC
+  LIMIT 20
+  RETURN {name: e.entity_name, type: e.entity_type, files: e.files}
 ```
 
-Read a numeric attribute. Note the `.value` hop, and that a computed attribute has
-`.expression` instead -- report those as computed, not as a number.
+Which elements are shared between two of the three models -- the same merge, seen
+across model boundaries:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.attributes.dryMass.value != null
-  RETURN {entity_name: e.entity_name, value: e.attributes.dryMass.value,
-          unit: e.attributes.dryMass.unit,
-          at: CONCAT(e.source_file, ":", e.source_line)}
+  FILTER LENGTH(e.models) > 1
+  RETURN {name: e.entity_name, type: e.entity_type, models: e.models}
 ```
 
-Sum a numeric attribute over a containment subtree. A part **usage** carries no
-values of its own -- `part stage1 : 'S-IC'` is an occurrence of the part
-**definition** `S-IC`, and the mass is declared there. So a rollup has to follow
-`owns` and `typedBy` together, or it walks to the usages and finds nothing.
-
-```aql
-FOR e IN sysml_Entities
-  FILTER e.name == "SaturnV"
-  LET parts = (
-    FOR child, edge IN 1..6 OUTBOUND e sysml_Relations
-      FILTER edge.relationship_type IN ["owns", "typedBy"]
-      FILTER child.attributes.dryMass.value != null
-      RETURN DISTINCT {name: child.name, mass: child.attributes.dryMass.value,
-                       unit: child.attributes.dryMass.unit,
-                       at: CONCAT(child.source_file, ":", child.source_line)})
-  RETURN {total: SUM(parts[*].mass), contributors: parts}
-```
-
-Multi-hop traceability: a function, what performs it, and what specializes that.
-
-Same usage-versus-definition rule as the rollup, in its other form. `perform
-LaunchSystem::guideAscentTrajectory` attaches the `performs` edge to the **usage**,
-and the usage is `typedBy` the `GuideAscentTrajectory` **definition**. Starting from
-the definition, the first hop is INBOUND `typedBy` to reach its usages; only then
-does INBOUND `performs` find the component.
-
-```aql
-FOR fn IN sysml_Entities
-  FILTER fn.name == "GuideAscentTrajectory"
-  FOR usage, typing IN 1..1 INBOUND fn sysml_Relations
-    FILTER typing.relationship_type == "typedBy"
-    FOR logical, performed IN 1..1 INBOUND usage sysml_Relations
-      FILTER performed.relationship_type == "performs"
-      FOR technical, spec IN 1..1 INBOUND logical sysml_Relations
-        FILTER spec.relationship_type == "specializes"
-        RETURN DISTINCT {function: fn.name, logical: logical.name,
-                         technical: technical.name,
-                         at: CONCAT(technical.source_file, ":", technical.source_line)}
-```
-
-A feature whose value is another element carries a `valueRef` edge to it, alongside
-the stored value. That covers two different questions, told apart by the target and
-not by the edge:
-
-- the target `is_variant` -- a concrete part binding one alternative of a `variation`
-  with `:>> feature = Variation::variant`
-- the target is an `EnumerationUsage` -- a feature set to an enumeration literal
-
-So a question about what a configuration selects filters `valueRef` **and**
-`is_variant`. Comparing those selections against each other is how a configuration is
-checked for internal consistency; nothing in SysML enforces it.
-
-```aql
-FOR e IN sysml_Entities
-  FILTER e.name == "forestFireObservationDrone"
-  FOR variant, edge IN 1..2 OUTBOUND e sysml_Relations
-    FILTER edge.relationship_type == "valueRef" AND variant.is_variant == true
-    RETURN {feature: DOCUMENT(edge._from).name, variant: variant.name,
-            value: variant.attributes.value.value,
-            at: CONCAT(variant.source_file, ":", variant.source_line)}
-```
-
-The same edge, read the other way -- which enumeration literal a feature is set to.
-
-```aql
-FOR e IN sysml_Entities
-  FILTER e.name == "NASA"
-  FOR lit, edge IN 1..2 OUTBOUND e sysml_Relations
-    FILTER edge.relationship_type == "valueRef"
-    FILTER lit.entity_type == "EnumerationUsage"
-    RETURN {feature: DOCUMENT(edge._from).entity_name, literal: lit.name}
-```
-
-Variation points and the variants under them.
-
-```aql
-FOR v IN sysml_Entities
-  FILTER v.is_variation == true AND v.model == "drone-logical"
-  LET variants = (
-    FOR child, edge IN 1..1 INBOUND v sysml_Relations
-      FILTER edge.relationship_type == "variantOf"
-      RETURN {name: child.name, value: child.attributes.value.value,
-              at: CONCAT(child.source_file, ":", child.source_line)})
-  RETURN {variation: v.entity_name, variants}
-```
-
-Community reports, for a question about the model as a whole rather than one element.
+The community layer. Level 0 is the coarsest, level 2 the finest; `occurrence` is
+how much of the corpus the cluster covers:
 
 ```aql
 FOR c IN sysml_Communities
-  FILTER c.level == 1
+  FILTER c.level == 0
   SORT c.occurrence DESC
-  RETURN {title: c.title, members: c.occurrence, report: c.report_string}
+  LIMIT 5
+  RETURN {title: c.report_json.title, summary: c.report_json.summary,
+          findings: c.report_json.findings, occurrence: c.occurrence}
 ```
 
-State machine order, following `transitionsTo`. Transitions are declared between
-the state **usages** inside a state machine body, so start from a usage (lowercase
-names like `poweredDescent`) rather than from the phase definition.
+Which elements are in a community, through the `IN_COMMUNITY` edge:
 
 ```aql
-FOR e IN sysml_Entities
-  FILTER e.name == "poweredDescent"
-  FOR next, edge IN 1..3 OUTBOUND e sysml_Relations
-    FILTER edge.relationship_type == "transitionsTo"
-    RETURN {to: next.name, trigger: edge.trigger,
-            at: CONCAT(next.source_file, ":", next.source_line)}
+FOR c IN sysml_Communities
+  FILTER c.level == 0
+  SORT c.occurrence DESC LIMIT 1
+  FOR e IN 1..1 INBOUND c sysml_Relations
+    FILTER IS_SAME_COLLECTION('sysml_Entities', e)
+    LIMIT 30
+    RETURN {community: c.report_json.title, member: e.entity_name,
+            type: e.entity_type}
+```
+
+Which file an element came from, walking it rather than reading `files` -- useful
+when the question is about the source text rather than the element:
+
+```aql
+LET e = FIRST(FOR x IN sysml_Entities
+               FILTER x.entity_name == UPPER(@name) RETURN x)
+FOR chunk IN 1..1 OUTBOUND e sysml_Relations
+  FILTER IS_SAME_COLLECTION('sysml_Chunks', chunk)
+  FOR doc IN 1..1 OUTBOUND chunk sysml_Relations
+    FILTER IS_SAME_COLLECTION('sysml_Documents', doc)
+    RETURN DISTINCT {file: doc.file_name, url: doc.citable_url,
+                     text: chunk.content}
 ```
 
 ## Analogies between models
 
-A `SIMILAR_TO` edge is the one kind of edge no `.sysml` file states. It joins two
-elements in **different** models that were found to resemble each other, and it is
-what a question comparing two vehicles is asking about -- there is no authored
-relation across a model boundary, so a traversal that filters `RELATED_TO` will
-find nothing between Apollo and the drone.
+`SIMILAR_TO` edges are the only ones in the graph that were **computed** rather
+than read out of a source file. Every `RELATED_TO` edge is something the
+extraction found stated in the text; a `SIMILAR_TO` edge means two elements of the
+same kind in different models resemble each other. Keep them apart: a question
+about what the model *says* must filter `type == 'RELATED_TO'`.
 
-It carries `cosine` (how close the two descriptions are, higher is closer),
-`analogy_role` (the kind of element both are -- `Part`, `Port`, `Requirement`) and
-a `description` already written as a sentence. It has no `relationship_type`,
-because it is not a SysML relation.
-
-An edge is stored in one direction only and means the same thing read either way,
-so traverse it with `ANY`, never `OUTBOUND`.
-
-The start of a traversal is one vertex, never a list. Select the elements with an
-ordinary `FOR` and traverse from the loop variable; a subquery in the start
-position returns no rows rather than an error, which is indistinguishable from an
-element genuinely having no counterpart.
+  `analogy_role` the shared `entity_type`, e.g. `requirement`, `part`
+  `cosine` how close the two descriptions are; nothing below 0.55 is kept
+  `weight` the same number, so the retriever ranks on it
 
 What plays a given element's role in another model:
 
 ```aql
-FOR e IN sysml_Entities
-  FILTER e.name == "ctrlPort"
-  FOR other, edge IN 1..1 ANY e sysml_Relations
-    FILTER edge.type == "SIMILAR_TO"
-    SORT edge.cosine DESC
-    RETURN {element: e.name, counterpart: other.name, model: other.model,
-            cosine: edge.cosine,
-            at: CONCAT(other.source_file, ":", other.source_line)}
+LET e = FIRST(FOR x IN sysml_Entities
+               FILTER x.entity_name == UPPER(@name) RETURN x)
+FOR v, r IN 1..1 ANY e sysml_Relations
+  FILTER r.type == 'SIMILAR_TO'
+  SORT r.cosine DESC
+  RETURN {counterpart: v.entity_name, models: v.models,
+          role: r.analogy_role, cosine: r.cosine, why: r.description}
 ```
 
-The same shape over a whole class of elements -- every drone part with an Apollo
-counterpart:
-
-```aql
-FOR e IN sysml_Entities
-  FILTER e.model == "drone-logical"
-     AND e.entity_type IN ["PartUsage", "PartDefinition"]
-  FOR other, edge IN 1..1 ANY e sysml_Relations
-    FILTER edge.type == "SIMILAR_TO" AND other.model == "apollo-11"
-    SORT edge.cosine DESC
-    LIMIT 5
-    RETURN {drone: e.name, apollo: other.name, cosine: edge.cosine}
-```
-
-Every analogy between two named models, strongest first:
+Every analogy, strongest first:
 
 ```aql
 FOR r IN sysml_Relations
-  FILTER r.type == "SIMILAR_TO"
+  FILTER r.type == 'SIMILAR_TO'
   LET a = DOCUMENT(r._from), b = DOCUMENT(r._to)
-  FILTER [a.model, b.model] ALL IN ["drone-logical", "apollo-11"]
+  FILTER a != null AND b != null
   SORT r.cosine DESC
-  LIMIT 20
-  RETURN {a: a.name, b: b.name, role: r.analogy_role, cosine: r.cosine}
+  LIMIT 25
+  RETURN {a: a.entity_name, a_model: a.models, b: b.entity_name,
+          b_model: b.models, role: r.analogy_role, cosine: r.cosine}
 ```
 
-Which elements have no counterpart in another model at all -- the parts of one
-vehicle that nothing in the other resembles:
+Which elements of one model have **no** counterpart in another -- the more useful
+question, because it names what the smaller model does not cover:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.model == "drone-logical" AND e.entity_type IN ["PartUsage", "PartDefinition"]
-  LET counterparts = LENGTH(
-    FOR r IN sysml_Relations
-      FILTER r.type == "SIMILAR_TO" AND (r._from == e._id OR r._to == e._id)
-      LIMIT 1 RETURN 1)
-  FILTER counterparts == 0
-  RETURN {name: e.name, at: CONCAT(e.source_file, ":", e.source_line)}
+  FILTER 'drone-logical' IN e.models AND e.entity_type == 'part'
+  LET analogues = LENGTH(
+    FOR v, r IN 1..1 ANY e sysml_Relations
+      FILTER r.type == 'SIMILAR_TO' RETURN 1)
+  FILTER analogues == 0
+  RETURN {name: e.entity_name, files: e.files}
 ```
-
-Note for query writers: the service's read-only guard tests whether the strings
-INSERT, UPDATE, REPLACE, REMOVE or UPSERT appear **anywhere** in the query text, not
-as keywords. An element name containing one of them -- `LunarOrbitInsertionPhase`
-contains "INSERT" -- makes a perfectly ordinary read query be rejected as a write.
-Where a question is about such an element, match it another way, for example
-`FILTER e.short_name == ...` or `FILTER CONTAINS(e.name, "LunarOrbit")`.

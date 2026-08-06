@@ -1,10 +1,11 @@
-"""Paths, connection settings and the collection names the importer schema uses.
+"""Paths, connection settings, the ontology, and the collection names.
 
-The names and the edge vocabulary are imported from graphrag_importer rather than
-restated here. Restating them is how they drift: this file used to claim
-`HAS_PARENT` was part of the importer's closed set, and it never was -- the
-importer's community-hierarchy edge is `SUB_COMMUNITY_OF`, so every parent edge
-written under the old name was invisible to an importer-side reader.
+Names, artifact file names and the edge vocabulary are imported from
+graphrag_importer rather than restated here. Restating them is how they drift:
+this file used to claim `HAS_PARENT` was part of the importer's closed set, and it
+never was -- the importer's community-hierarchy edge is `SUB_COMMUNITY_OF`, so
+every parent edge written under the old name was invisible to an importer-side
+reader.
 
 Everything points at a local ArangoDB container. Nothing here touches a shared or
 hosted deployment.
@@ -22,13 +23,14 @@ from arango.database import StandardDatabase
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
 OUT = ROOT / "out"
-MODEL_JSON = OUT / "model.json"
+KG = OUT / "kg"                  # GraphRAG's working_dir: extraction artifacts + LLM cache
 AQL_EXAMPLES = Path(__file__).resolve().parent / "aql_examples.md"
 
-# The three Arango repos this project reads, cloned next to it.
+# The four Arango repos this project reads, cloned next to it.
 IMPORTER_REPO = ROOT.parent / "graphrag_importer"
 AUTOGRAPH_REPO = ROOT.parent / "autograph"
 SERVICE_REPO = ROOT.parent / "natural-language-service"
+RETRIEVER_REPO = ROOT.parent / "graphrag_retrievers"
 
 ARANGO_URL = os.environ.get("ARANGO_URL", "http://localhost:8529")
 ARANGO_USER = os.environ.get("ARANGO_USER", "root")
@@ -42,7 +44,7 @@ os.environ.setdefault("GENAI_PROJECT_NAME", PROJECT)
 if str(IMPORTER_REPO) not in sys.path:
     sys.path.insert(0, str(IMPORTER_REPO))
 try:
-    from graphrag.naming import CollectionNames, IndexNames, RelationshipTypes
+    from graphrag.naming import CollectionNames, FileNames, IndexNames, RelationshipTypes
 except ImportError as exc:  # pragma: no cover - a missing clone, not a code path
     raise RuntimeError(
         f"cannot import graphrag.naming ({exc}). Clone graphrag_importer next to "
@@ -61,20 +63,24 @@ GRAPH = f"{PROJECT}_kg"
 VERTEX_COLLECTIONS = (DOCUMENTS, CHUNKS, ENTITIES, COMMUNITIES)
 ALL_COLLECTIONS = VERTEX_COLLECTIONS + (RELATIONS,)
 
+# The five artifacts extraction leaves in KG, named by the importer's own class so
+# the two halves cannot disagree about what the files are called.
+ARTIFACTS = FileNames
+
 # The field the importer vector-indexes: "embedding", singular. autograph writes
 # "embeddings". Writing the wrong one is invisible -- the rows are there, the
 # vectors are there, and every vector query returns nothing.
 EMBEDDING_FIELD = IndexNames.EMBEDDING_FIELD
-EMBED_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
-# autograph's EmbeddingConfig reads this same variable, and the vector index is
-# built for whatever it says rather than for the width of the vectors it finds.
-EMBED_DIM = int(os.environ.get("EMBEDDING_DIM", "768"))
+VECTOR_INDEX = IndexNames.VECTOR_COSINE
+
+# Fixed by the importer, not chosen here: `openai_embedding` calls
+# text-embedding-3-small with no `dimensions` argument, so vectors are always
+# 1536 wide (graphrag/graph_builder/builder/_llm.py). The retrievers have to be
+# told the same number or their queries return nothing.
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIM = 1536
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o")
 
-# `type` on an edge is closed, which is why the authored SysML relation lives in
-# `relationship_type` instead -- the schema's own field for exactly that.
-# SUB_COMMUNITY_OF is left out of the validation set upstream but is written by
-# import_graph_to_adb and walked by the delete engine, so it counts as in-schema.
 SUB_COMMUNITY_OF = RelationshipTypes.SUB_COMMUNITY_OF
 EDGE_TYPES = tuple(sorted(RelationshipTypes.get_expected_types() | {SUB_COMMUNITY_OF}))
 
@@ -104,10 +110,55 @@ MODELS_INDEX = {
 }
 
 
+def model_of(relative_path: str) -> str:
+    for prefix, label in MODELS_INDEX.items():
+        if relative_path == prefix or relative_path.startswith(f"{prefix}/"):
+            return label
+    return "unknown"
+
+
+# --------------------------------------------------------------------- ontology
+
+# The two lists handed to the extraction pipeline, and the only thing this project
+# tells it about SysML. `entity_types` and `relationship_types` are constructor
+# arguments on GraphRAG; with `enable_strict_types` an extracted entity or edge
+# whose type is not on the matching list is dropped rather than renamed, so these
+# are a closed vocabulary and not a hint.
+#
+# Both are the vocabulary the hand-written parser used to recognise in the
+# grammar, moved out of Python and into the prompt. Nothing else changed about
+# them: the same 27 declaration kinds, the same 18 relations.
+KINDS = [
+    "Package", "Part", "Action", "State", "Port", "Item", "Attribute",
+    "Requirement", "Calc", "Analysis", "Connection", "Interface", "View",
+    "Viewpoint", "Enumeration", "Concern", "Constraint", "Flow", "Allocation",
+    "Event", "Metadata", "UseCase", "Rendering", "Verification", "Snapshot",
+    "Timeslice", "Occurrence",
+]
+
+RELATIONS_ONTOLOGY = [
+    "owns", "typedBy", "specializes", "redefines", "satisfies", "refines",
+    "derives", "performs", "subject", "exhibits", "connects", "transitionsTo",
+    "variantOf", "imports", "sliceOf", "sends", "dependsOn", "valueRef",
+]
+
+# What both come back as. `_merge_nodes_then_upsert` lowercases the winning type
+# before it stores it, so `UseCase` is written as `usecase` and `typedBy` as
+# `typedby` -- which is what a query has to match on.
+ENTITY_TYPES = [k.lower() for k in KINDS]
+RELATIONSHIP_TYPES = [r.lower() for r in RELATIONS_ONTOLOGY]
+
+
+# ------------------------------------------------------------------ connections
+
+
 def openai_key() -> str:
     key = os.environ.get("CHAT_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("set CHAT_API_KEY (or OPENAI_API_KEY) to an OpenAI key")
+    # The extraction half builds its own `AsyncOpenAI()` with no arguments, which
+    # reads OPENAI_API_KEY and nothing else.
+    os.environ["OPENAI_API_KEY"] = key
     return key
 
 
@@ -122,6 +173,17 @@ def db(create: bool = False) -> StandardDatabase:
         if not sys_db.has_database(DB_NAME):
             sys_db.create_database(DB_NAME)
     return c.db(DB_NAME, username=ARANGO_USER, password=ARANGO_PASS)
+
+
+def token() -> str:
+    """A database JWT. Both the importer and the retrievers authenticate with one
+    rather than a password, and ArangoDB issues an acceptable one itself."""
+    import requests
+
+    r = requests.post(f"{ARANGO_URL}/_open/auth", timeout=15,
+                      json={"username": ARANGO_USER, "password": ARANGO_PASS})
+    r.raise_for_status()
+    return r.json()["jwt"]
 
 
 def drop_vector_indexes(db, collection: str) -> int:
