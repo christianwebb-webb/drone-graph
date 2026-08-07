@@ -313,8 +313,21 @@ FOR v, e, p IN 1..6 OUTBOUND @start sysml_Relations
 
 A traversal starting at `1` excludes the element you started from. When the question
 is about *those elements themselves* -- "give each stage's dry mass" -- do not
-traverse at all, just read their attributes. Traverse only when the question is
-about what they contain, and use `0..N` when it is about both.
+traverse at all, just read their attributes. Traversing instead returns a row per
+element with every value null, which reads as "the model does not record this" when
+the truth is that the walk stepped straight past it:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.entity_name IN @names AND e.source_file != null
+  RETURN {element: e.entity_name,
+          dryMass: e.attributes.dryMass.value,
+          propellantMass: e.attributes.propellantMass.value,
+          at: CONCAT(e.source_file, ":", e.source_line)}
+```
+
+Traverse only when the question is about what those elements contain, and use `0..N`
+when it is about both.
 
 This matters most for containment rollups. A part's subtree is reached by `owns`
 to each usage and `typedby` from a usage to the definition that carries the values
@@ -352,34 +365,51 @@ which is a different question and usually a different number.
 ## "How many" means COUNT, not a list
 
 The result set is capped, so a query that returns one row per match and leaves the
-counting to the reader reports the cap as the answer. Compute the number in AQL.
-When the question wants both a number and examples, return both, and take the
-number from the whole set rather than from the sample:
+counting to the reader reports the cap as the answer -- ask for a total over three
+hundred requirements and get back "41", the size of the truncated list.
+
+Deciding this from the wording is unreliable, so decide it from the answer instead:
+**if the answer is a single number, the query must return a single row.** Compute it
+in AQL. The safe form covers both readings at once and is the one to reach for
+whenever a question is about a set rather than about one element -- the total is
+taken over the whole set, and the examples are a sample of it:
 
 ```aql
 LET unsatisfied = (
   FOR e IN sysml_Entities
     FILTER e.entity_type == 'requirement' AND 'apollo-11-sysml-v2' IN e.models
+    FILTER e.source_file != null
     FILTER LENGTH(FOR r IN sysml_Relations
              FILTER r._to == e._id AND r.relationship_type == 'satisfies'
+             AND r.stated == true
              RETURN 1) == 0
     RETURN e.entity_name)
 RETURN {total: LENGTH(unsatisfied), examples: SLICE(unsatisfied, 0, 10)}
 ```
 
-So "which requirements does nothing satisfy" looks for requirements with no
-**incoming** `satisfies` edge:
+Return one row per match only when the rows themselves are the answer and the
+question named no number -- "which requirements does nothing satisfy", where each
+one has to be identified. It looks for requirements with no **incoming** `satisfies`
+edge:
 
 ```aql
 FOR e IN sysml_Entities
   FILTER e.entity_type == 'requirement' AND 'DroneModelLogical' IN e.models
+  FILTER e.source_file != null
   LET satisfied = LENGTH(
     FOR r IN sysml_Relations
       FILTER r._to == e._id AND r.relationship_type == 'satisfies'
+      AND r.stated == true
       RETURN 1)
   FILTER satisfied == 0
-  RETURN {requirement: e.entity_name, files: e.files}
+  RETURN {requirement: e.entity_name, at: CONCAT(e.source_file, ":", e.source_line)}
 ```
+
+Both filters are load-bearing and neither is optional decoration. Without
+`source_file != null` the answer also counts the names extraction read in prose,
+which no declaration backs and no stated relation can reach, so every one of them
+lands in the result. Without `stated == true` it counts the LLM's reading of the
+prose as coverage.
 
 ## Examples
 
@@ -419,6 +449,7 @@ Count the elements of each kind in one model:
 ```aql
 FOR e IN sysml_Entities
   FILTER 'apollo-11-sysml-v2' IN e.models
+  FILTER e.source_file != null
   COLLECT type = e.entity_type WITH COUNT INTO n
   SORT n DESC LIMIT 10
   RETURN {type, n}
@@ -436,16 +467,20 @@ FOR r IN sysml_Relations
           how: r.description, files: a.files}
 ```
 
-Everything one named element is attached to, in both directions:
+Everything a named element is attached to, in both directions. Note the outer `FOR`
+where `FIRST(...)` would be shorter: a name or an identifier can belong to more than
+one row -- a definition and a usage, a short name and a name -- and collapsing to one
+of them drops the other's edges without saying so. Iterate, and let the rows show how
+many were found:
 
 ```aql
-LET e = FIRST(FOR x IN sysml_Entities
-               FILTER x.entity_name == UPPER(@name) RETURN x)
-FOR v, r IN 1..1 ANY e sysml_Relations
-  FILTER r.type == 'RELATED_TO'
-  RETURN {relation: r.relationship_type, other: v.entity_name,
-          direction: r._from == e._id ? 'outgoing' : 'incoming',
-          description: r.description}
+FOR e IN sysml_Entities
+  FILTER e.entity_name == UPPER(@name) OR e.short_name == UPPER(@name)
+  FOR v, r IN 1..1 ANY e sysml_Relations
+    FILTER r.type == 'RELATED_TO'
+    RETURN {of: e.entity_name, relation: r.relationship_type, other: v.entity_name,
+            direction: r._from == e._id ? 'outgoing' : 'incoming',
+            stated: r.stated == true, description: r.description}
 ```
 
 Which elements appear in more than one source file -- extraction merges elements by
@@ -497,14 +532,14 @@ Which file an element came from, walking it rather than reading `files` -- usefu
 when the question is about the source text rather than the element:
 
 ```aql
-LET e = FIRST(FOR x IN sysml_Entities
-               FILTER x.entity_name == UPPER(@name) RETURN x)
-FOR chunk IN 1..1 OUTBOUND e sysml_Relations
-  FILTER IS_SAME_COLLECTION('sysml_Chunks', chunk)
-  FOR doc IN 1..1 OUTBOUND chunk sysml_Relations
-    FILTER IS_SAME_COLLECTION('sysml_Documents', doc)
-    RETURN DISTINCT {file: doc.file_name, url: doc.citable_url,
-                     text: chunk.content}
+FOR e IN sysml_Entities
+  FILTER e.entity_name == UPPER(@name) OR e.short_name == UPPER(@name)
+  FOR chunk IN 1..1 OUTBOUND e sysml_Relations
+    FILTER IS_SAME_COLLECTION('sysml_Chunks', chunk)
+    FOR doc IN 1..1 OUTBOUND chunk sysml_Relations
+      FILTER IS_SAME_COLLECTION('sysml_Documents', doc)
+      RETURN DISTINCT {file: doc.file_name, url: doc.citable_url,
+                       text: chunk.content}
 ```
 
 ## Analogies between models
@@ -554,9 +589,10 @@ question, because it names what the smaller model does not cover:
 ```aql
 FOR e IN sysml_Entities
   FILTER 'DroneModelLogical' IN e.models AND e.entity_type == 'part'
+  FILTER e.source_file != null
   LET analogues = LENGTH(
     FOR v, r IN 1..1 ANY e sysml_Relations
       FILTER r.type == 'SIMILAR_TO' RETURN 1)
   FILTER analogues == 0
-  RETURN {name: e.entity_name, files: e.files}
+  RETURN {name: e.entity_name, at: CONCAT(e.source_file, ":", e.source_line)}
 ```

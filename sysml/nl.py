@@ -5,9 +5,12 @@ package from natural-language-service, imported unmodified. It inspects the
 collections, writes AQL, runs it and explains the rows. The only thing this project
 gives it is `aql_examples`, read from `aql_examples.md` -- the argument
 `ReadOnlyArangoGraphQAChain.from_llm` has always accepted and the deployed service
-never passes. There are no hand-written query functions here: if an answer is wrong
-the fix goes in that file, not into Python. `instance(path)` primes it with a
-different file instead, which is how the generated one gets compared against it.
+never passes. No query is written here: if an answer is wrong the fix goes in that
+file. `provenance_gap` is the one exception and does not write AQL either -- it reads
+the query that came back and, on the one mistake that leaves a query running cleanly
+and counting the wrong set, sends the question round again with the fault named.
+`instance(path)` primes the whole thing with a different examples file, which is how
+the generated one gets compared against the hand-written one.
 
 `graphrag(question)` -- the GraphRAG retriever service from graphrag_retrievers,
 run in-process against the local database. `local` is hybrid vector + BM25 search
@@ -53,6 +56,53 @@ OPENAI_URL = "https://api.openai.com/v1"
 # without clearing this first. It lives in `config` because the generated-primer
 # step runs model-written AQL too, and one gate is easier to trust than two.
 MUTATION = config.MUTATION
+
+# A generated query that picks entities out by type or model and then aggregates
+# over them is answering a question about a population, and the population a
+# question about a model means is the one the files declare. Without
+# `source_file != null` the count also covers the rows extraction named while
+# reading prose; no declaration backs those and no stated relation can reach them,
+# so every one of them lands in a "nothing satisfies it" answer -- 33 unsatisfied
+# requirements where the file declares 23.
+#
+# The rule is written in `aql_examples.md`, and the worked examples there now show
+# it, which is the part that actually carries. Prose in a long primer does not: the
+# same run that copied an example query verbatim ignored the paragraph beside it.
+# So the query that comes back is checked here as well, and a query missing the
+# filter is sent back with the omission named. That is the one form of instruction
+# a model cannot skim past, and unlike wording it can be tested.
+SCANS_ENTITIES = re.compile(r"\bFOR\s+\w+\s+IN\s+" + config.ENTITIES + r"\b")
+# On a FILTER line, so that iterating an element's own `models` list -- which is how
+# the read-versus-inferred breakdown groups its rows -- is not read as selecting a
+# population. That query is about both layers and must not be filtered to one.
+POPULATION = re.compile(r"FILTER[^\n]*(\.entity_type\s*==|\bIN\s+\w+\.models\b)")
+AGGREGATE = re.compile(r"\bCOLLECT\b|\bCOUNT\s*\(|\bLENGTH\s*\(\s*FOR\b", re.S)
+COUNTS_RELATIONS = re.compile(r"\.relationship_type\s*==")
+
+
+def provenance_gap(aql: str | None) -> str:
+    """What to tell the model about a population query, or "" if it is already right.
+
+    Reads the query and nothing else. A generated query is a thing with a shape that
+    can be checked; the English question that produced it is not, and guessing intent
+    from its wording would trade one unreliable reading for another.
+    """
+    if not aql or not (SCANS_ENTITIES.search(aql)
+                       and POPULATION.search(aql) and AGGREGATE.search(aql)):
+        return ""
+    missing = []
+    if "source_file" not in aql:
+        missing.append("filter the entities on `source_file != null`, so the answer "
+                       "covers what the files declare rather than the names the "
+                       "extraction step read in prose")
+    if COUNTS_RELATIONS.search(aql) and "stated" not in aql:
+        missing.append("add `AND r.stated == true` where the relations are counted, "
+                       "so coverage means a relation a file states")
+    if not missing:
+        return ""
+    return ("Correction: that query aggregates over a population without filtering it "
+            "to the declared elements. Write it again, and " + ", and ".join(missing) + ".")
+
 
 # Passed to the retriever as `response_instructions`, which is its supported way to
 # shape an answer.
@@ -135,6 +185,9 @@ class Answer:
     context: str = ""
     error: str | None = None
     retrieved: str = ""
+    # Not an error -- the answer stands. It says something about how the query was
+    # arrived at that the query alone does not show.
+    note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -177,6 +230,8 @@ class Answer:
                 print(f"   {line}")
         if self.error:
             print(f"\n!! {self.error}")
+        if self.note:
+            print(f"\n(  {self.note})")
         # What the answer was built from. On the retrieval paths this is a summary
         # of the search, and `rows` is the citation map -- which is a subset of
         # what was read, not the whole of it. Printing only the citations made a
@@ -255,6 +310,14 @@ class Aqlizer:
         if self._service is None:
             from txt2aql.service import Txt2AqlService
             self._service = Txt2AqlService()
+            # The service builds its ChatOpenAI without a temperature, so
+            # LangChain sends none and the API default of 1.0 applies -- to a
+            # code-generation task. Asked the same question four times it wrote
+            # four different queries, two of which disagreed about the answer.
+            # At 0 it writes one. The seed is best-effort on OpenAI's side and
+            # only narrows what is left; the temperature is what matters.
+            self._service._llm.temperature = 0
+            self._service._llm.seed = 1
         return self._service
 
     def graph(self):
@@ -311,8 +374,24 @@ class Aqlizer:
         return ReadOnlyArangoGraphQAChain.from_llm(llm=self.service._llm, **kwargs)
 
     def ask(self, question: str, primed: bool = True, top_k: int = 40) -> Answer:
+        chain = self.chain(primed, top_k)
+        answer = self._invoke(chain, question, question)
+        correction = provenance_gap(answer.aql)
+        if not correction or not answer.ok:
+            return answer
+        # One retry, and it is kept only if it closed the gap. A second attempt that
+        # is wrong in the same way is no better than the first, and returning it
+        # would hide that the correction went unheeded.
+        retried = self._invoke(chain, f"{question}\n\n{correction}", question)
+        if retried.ok and not provenance_gap(retried.aql):
+            retried.note = "re-asked once: " + correction[len("Correction: "):]
+            return retried
+        answer.note = "unresolved -- " + correction[len("Correction: "):]
+        return answer
+
+    def _invoke(self, chain, prompt: str, question: str) -> Answer:
         try:
-            result = self.chain(primed, top_k).invoke({"query": question})
+            result = chain.invoke({"query": prompt})
         except Exception as exc:
             return Answer(question, "", error=f"{type(exc).__name__}: {exc}")
         aql = re.sub(r"^```(?:aql)?|```$", "", _text(result.get("aql_query")), flags=re.M).strip()

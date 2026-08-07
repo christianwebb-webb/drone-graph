@@ -70,13 +70,15 @@ rationale too, and it is not specific to one input language. The two lists in
 it about SysML; `enable_strict_types=True` makes them closed, so an entity or edge
 typed outside them is dropped rather than renamed.
 
-**Cost:** entity names come back upper-cased, and the LLM is unreliable about
-anything the syntax states mechanically -- on this corpus it produced 68 `owns`
-edges where the files state about eighteen hundred, found 99 of the 273 `satisfy`
-statements written down, and left `S-IC` with no relations at all. Its `typedby`
-guesses point backwards. That is what
-`structure` exists to fix. Every LLM answer is cached in `out/kg`, so a second run
-over unchanged sources is free.
+**Cost:** entity names come back upper-cased, and the LLM is still not exhaustive
+about anything the syntax states mechanically -- on this corpus it produced 944
+`owns` edges where the files state 1,793, and 221 `satisfies` where the files state
+265. Of the 2,158 edges it reports, 1,587 coincide with an edge the syntax states
+and 571 do not, and there is no way to tell which is which from the edge itself.
+That is what `structure` exists to fix: it reads the same files with a lexer and
+marks every edge the syntax states with `stated: true`, so a question that needs
+the declared model can filter for it. Every LLM answer is cached in `out/kg`, so a
+second run over unchanged sources is free.
 
 ### 2. load -- `sysml/pipeline/load.py`
 
@@ -127,7 +129,9 @@ nearest enclosing declaration wins, then the shallowest, and a dotted path like
 rather than containment, because that is what the dots mean. Anything still
 ambiguous is dropped instead of guessed. That is what lets all but one of the 273
 `satisfy` statements resolve, where matching on the last name alone got 209 and
-some of those were bound to the wrong element.
+some of those were bound to the wrong element. The graph holds 265 `satisfies`
+edges rather than 272 because seven of those statements are written twice, and an
+edge is a pair rather than a line.
 
 It knows SysML v2's declaration grammar, not this corpus: any modifier or `#`
 metadata annotation, a keyword in `KEYWORDS`, optionally `case` and `def`, an
