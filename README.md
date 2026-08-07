@@ -195,7 +195,7 @@ same word, and "what plays the drone battery's role in Apollo?" has no path to w
 
 ### 4. examples -- `sysml/pipeline/examples.py`
 
-Writes `sysml/aql_examples_generated.md`, the primer AQLizer is given, from the
+Writes `out/aql_examples_generated.md`, the primer AQLizer is given, from the
 finished graph -- a fixed prompt holding what is true of any graph this pipeline
 builds, plus a survey of this one: which entity types occur, which attribute names
 exist and in what units, real short names, real snapshot names, which relations were

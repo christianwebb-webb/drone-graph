@@ -4,7 +4,7 @@
   load      out/kg -> the graphrag_importer collections in ArangoDB, then
             `structure` over the same sources for the parts that must be exact
   analogy   cross-model SIMILAR_TO edges, found by autograph's SimilarityFinder
-  examples  the finished graph -> aql_examples_generated.md, the AQLizer primer,
+  examples  the finished graph -> out/aql_examples_generated.md, the AQLizer primer,
             written by a strong model from a survey of what was built
 
 `structure` is not a step of its own because it has to run inside `load`, between

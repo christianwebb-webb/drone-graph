@@ -54,10 +54,7 @@ def main() -> None:
 
     print("\n== analogy ==")
     analogy.main()
-
-    # Last, and reading the database rather than the sources: the primer describes
-    # the graph, so every earlier step has to have finished writing it -- the
-    # analogy edges included, or the file it writes will not know they exist.
+    
     if args.examples:
         print("\n== examples ==")
         examples.main()

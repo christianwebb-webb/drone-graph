@@ -28,8 +28,10 @@ KG = OUT / "kg"                  # GraphRAG's working_dir: extraction artifacts 
 AQL_EXAMPLES = Path(__file__).resolve().parent / "aql_examples.md"
 # The same file written by `pipeline.examples` instead of by hand. It is a second
 # file rather than a replacement: the read side takes AQL_EXAMPLES unless it is
-# told otherwise, so generating one cannot change an answer by accident.
-AQL_EXAMPLES_GENERATED = Path(__file__).resolve().parent / "aql_examples_generated.md"
+# told otherwise, so generating one cannot change an answer by accident. It lives
+# in OUT and not beside the hand-written one because it describes the graph this
+# run built -- a stale copy from an older build is wrong, not merely old.
+AQL_EXAMPLES_GENERATED = OUT / "aql_examples_generated.md"
 
 # The four Arango repos this project reads, cloned next to it.
 IMPORTER_REPO = ROOT.parent / "graphrag_importer"

@@ -1,11 +1,12 @@
 """The part of a SysML file that must not be guessed: values and containment.
 
-Extraction reads the prose and is good at it. It is unreliable at the two things
-SysML states mechanically -- `attribute dryMass = 137000 [kg]` and
+Extraction reads the prose and is good at it. It is not exhaustive at the two
+things SysML states mechanically -- `attribute dryMass = 137000 [kg]` and
 `part stage1 : 'S-IC'` -- and those are exactly what an analytical question needs.
-On this corpus it produced 68 `owns` edges out of roughly two thousand written
-down, left `S-IC` with no relations at all, and put every number inside a
-sentence. A rollup over a containment subtree has nothing to walk.
+On this corpus it reports 944 `owns` edges where the files state 1,793, and it
+leaves every number inside a sentence rather than as a value with a unit. A rollup
+over a containment subtree has nothing to walk, and a subtree missing half its
+edges is worse than none: it answers, and the answer is short.
 
 So this step reads the same files with a lexer and writes down only what the
 syntax says outright:
