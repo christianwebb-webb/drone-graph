@@ -8,10 +8,6 @@ docker run -d --name christian-webb-drone-arango -p 8529:8529 \
 python build.py                 # extract -> load -> analogy -> examples
 ```
 
-The OpenAI key is read from `CHAT_API_KEY` (or `OPENAI_API_KEY`) in the `env` file
-one directory up, beside the cloned repos; an exported variable of either name is
-used when the file has neither.
-
 You must have the 4 requisite Arango repos cloned adjacent to this one.
 
 ## The pipeline
@@ -23,10 +19,11 @@ Reads every `.sysml` file under `models/` and hands the text to
 the relations between them, clusters the result with Leiden and writes one report
 per cluster.
 
-One model at a time, each on its own dir under `out/kg/<model>`. 
+One model at a time, each in its own directory under `out/kg/<model>`. 
 
 - We enable strict types, and pass in an ontology that is defined in config.py
-- This includes 27 kinds and 18 relationship types
+- The 27 kinds of entity are derived from the SysML spec
+- The 18 relationship types were partially gotten from teh SysML spec, but I think there are some inaccuracies
 
 ### 2. load -- `sysml/pipeline/load.py` - graphrag_importer
 
@@ -42,37 +39,19 @@ the edges, and then get the embeddings itself afterwards.
 Reads every `.sysml` file again with a deterministic parser and make fields for what the syntax
 says outright: 
 - an `attributes` map of `{value, unit}` or `{expression}` on the element that declares it
-- its `short_name`, `source_file` / `source_line`
 - the `owns`, `typedby`, `specializes`, `redefines` and `satisfies` edges
 
-**Why:** the numbers and the tree have to be exact, and an LLM is not. Without this,
+**Why:** the numbers have to be exact, and an LLM is not. Without this,
 AQLizer questions like "sum the dry mass of the Saturn V from its stages" return nothing. 
-With it the answer is 188,650 kg from the four things the Saturn V
-declares -- S-IC, S-II, S-IVB and the instrument unit -- and the four `...Cost`
-attributes on the mission add to $11bn.
 
-It knows SysML v2's declaration grammar, not specifically this corpus: any modifier or `#`
-metadata annotation, a keyword in `KEYWORDS`, optionally `case` and `def`, an
-optional `<shortName>`, a name, then any combination of `:`, `:>`, `:>>` and `=`.
-A body can continue its enclosing declaration with a bare `:>` or `:>>`, and
-`satisfy REQ by DESIGN` is read as the relation it states. A model it has never
-seen parses on the same rules -- `analytics-demo.ipynb` runs it on one to show
-that, using forms no file here contains.
+Edges it writes are `RELATED_TO` with the relation in `relationship_type`.
 
-Edges it writes are `RELATED_TO` with the relation in `relationship_type`, the same
-shape extraction writes, so nothing downstream has to know which pass produced an
-edge. 
-
-`stated: true` marks the ones that came from the parse (as opposed to from the LLM), for when you do want to
-tell them apart.
-
-It runs inside `load` rather than as a step of its own because creating an entity
-is impossible once the Entities vector index exists.
-
-### 3. analogy -- `sysml/pipeline/analogy.py`
+### 3. analogy -- `sysml/pipeline/analogy.py` - AutoGraph
 
 Adds cross-model `SIMILAR_TO` edges between entities of the same `entity_type` in
-different models, using autograph's own `SimilarityFinder`.
+different models, using autograph's `SimilarityFinder`.
+
+Uses minCosine of .55
 
 **Why:** extraction relates what a text talks about, and no Apollo file mentions a
 drone -- so nothing crosses a model boundary except where the two happen to use the
@@ -85,7 +64,8 @@ finished graph.
 
 AQLizer 
 
-It takes general info about converting SysML to Arango, then adds some syntax from the conversion thus far, and explains in depth what the examples file should be.
+It takes general info about converting SysML to Arango, then adds some syntax from the 
+conversion thus far, and explains in depth what the examples file should be.
 
 
 ## Asking questions

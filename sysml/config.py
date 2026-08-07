@@ -150,15 +150,13 @@ def kg(model: str) -> Path:
 
 # --------------------------------------------------------------------- ontology
 
-# The two lists handed to the extraction pipeline, and the only thing this project
-# tells it about SysML. `entity_types` and `relationship_types` are constructor
-# arguments on GraphRAG; with `enable_strict_types` an extracted entity or edge
-# whose type is not on the matching list is dropped rather than renamed, so these
-# are a closed vocabulary and not a hint.
-#
-# Both are the vocabulary the hand-written parser used to recognise in the
-# grammar, moved out of Python and into the prompt. Nothing else changed about
-# them: the same 27 declaration kinds, the same 18 relations.
+# KINDS comes from SysML v2 specs
+
+# AttributeDefinition, EnumerationDefinition, OccurrenceDefinition, ItemDefinition, 
+# PartDefinition, PortDefinition, ConnectionDefinition, InterfaceDefinition, FlowDefinition, 
+# AllocationDefinition, ActionDefinition, StateDefinition, ConstraintDefinition, RequirementDefinition, 
+# ConcernDefinition, CalculationDefinition, AnalysisCaseDefinition, VerificationCaseDefinition, UseCaseDefinition, 
+# ViewDefinition, ViewpointDefinition, RenderingDefinition, MetadataDefinition
 KINDS = [
     "Package", "Part", "Action", "State", "Port", "Item", "Attribute",
     "Requirement", "Calc", "Analysis", "Connection", "Interface", "View",
