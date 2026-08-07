@@ -174,21 +174,28 @@ FOR d IN {config.DOCUMENTS}
   UPDATE d WITH {{files: [d.file_name], models: [@models[d.file_name]]}}
   IN {config.DOCUMENTS}"""
 
+# Both walk the collection they then write to, so the traversal is finished and
+# materialised before the first update runs. Left as one pass, ArangoDB reads a
+# document the same query has already modified and fails the whole statement with
+# a write-write conflict, which is timing-dependent and so does not show up on
+# every run.
 STAMP_CHUNKS = f"""
-FOR c IN {config.CHUNKS}
+LET rows = (FOR c IN {config.CHUNKS}
   LET docs = (FOR d IN 1..1 OUTBOUND c {config.RELATIONS}
                 FILTER IS_SAME_COLLECTION('{config.DOCUMENTS}', d) RETURN d)
-  UPDATE c WITH {{files: SORTED(UNIQUE(docs[*].file_name)),
-                  models: SORTED(UNIQUE(FLATTEN(docs[*].models)))}}
-  IN {config.CHUNKS}"""
+  RETURN {{key: c._key, files: SORTED(UNIQUE(docs[*].file_name)),
+           models: SORTED(UNIQUE(FLATTEN(docs[*].models)))}})
+FOR row IN rows
+  UPDATE row.key WITH {{files: row.files, models: row.models}} IN {config.CHUNKS}"""
 
 STAMP_ENTITIES = f"""
-FOR e IN {config.ENTITIES}
+LET rows = (FOR e IN {config.ENTITIES}
   LET chunks = (FOR c IN 1..1 OUTBOUND e {config.RELATIONS}
                   FILTER IS_SAME_COLLECTION('{config.CHUNKS}', c) RETURN c)
-  UPDATE e WITH {{files: SORTED(UNIQUE(FLATTEN(chunks[*].files))),
-                  models: SORTED(UNIQUE(FLATTEN(chunks[*].models)))}}
-  IN {config.ENTITIES}"""
+  RETURN {{key: e._key, files: SORTED(UNIQUE(FLATTEN(chunks[*].files))),
+           models: SORTED(UNIQUE(FLATTEN(chunks[*].models)))}})
+FOR row IN rows
+  UPDATE row.key WITH {{files: row.files, models: row.models}} IN {config.ENTITIES}"""
 
 # An entity found in several chunks keeps one description per chunk, joined with
 # GRAPH_FIELD_SEP. Nothing downstream splits on it -- not the retrievers, not the

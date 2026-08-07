@@ -17,7 +17,7 @@ attribute values, containment and typing -- because those must be exact. Fields
 from the second pass are marked *(stated)* below and are always trustworthy;
 everything else is the LLM's reading.
 
-`sysml_Entities` -- one element each, 3137 of them.
+`sysml_Entities` -- one element each, 2291 of them.
   `entity_name` the element's name **in upper case**: `SATURNV`, `HLR-R060`,
      `COMMAND/SERVICE MODULE`. Extraction upper-cases every name, so a comparison
      against a mixed-case literal matches nothing.
@@ -31,7 +31,9 @@ everything else is the LLM's reading.
      the source text.
   `attributes` *(stated)* a MAP of attribute name -> `{value, unit}` for a number
      the file assigns, or `{expression}` when the file assigns a formula rather
-     than a value. 176 elements carry one. Units are reduced to the bare symbol,
+     than a value. 176 elements carry one, but the map is present and empty on
+     many more, so test `LENGTH(ATTRIBUTES(e.attributes)) > 0` rather than
+     `e.attributes != null`. Units are reduced to the bare symbol,
      so `[kg]`, `[SI::kg]` and `['kg']` all read `kg`. Common names: `dryMass`,
      `propellantMass`, `powerLoad`, `failureRate`, `mass`, and the four
      `...Cost` attributes on `APOLLO11MISSION`.
@@ -57,8 +59,8 @@ everything else is the LLM's reading.
 `sysml_Chunks` -- 114 windows of source text.
   `content`, `tokens`, `chunk_order_index`, plus `files` and `models`.
 
-`sysml_Communities` -- 144 Leiden clusters with an LLM-written report.
-  `title`, `report_string`, `level` (0, 1 or 2), `occurrence`, `sub_communities`,
+`sysml_Communities` -- 280 Leiden clusters with an LLM-written report.
+  `title`, `report_string`, `level` (0 to 3), `occurrence`, `sub_communities`,
   and `report_json` with `title`, `summary`, `findings`, `rating`,
   `rating_explanation`.
 
@@ -84,7 +86,34 @@ everything else is the LLM's reading.
   The structural edges have no `relationship_type`, so grouping by it counts SysML
   relations only. Group by `type` to count the structural edges as well.
 
-## The two things most likely to go wrong
+## The three things most likely to go wrong
+
+**Counting rows the files do not declare.** The graph holds two layers. An element
+with a `source_file` is one a file declares; an element without one is a name the
+extraction step read in prose, and no declaration backs it. Likewise an edge with
+`stated: true` is one the syntax states, and an edge without it is the LLM's reading.
+
+Any question that counts, ranks, or asks what is *missing* is answered over a set,
+and the set it means is the declared one. So put `e.source_file != null` on the
+elements and `r.stated == true` on the relations, on **every** such query, exactly as
+you would for a lookup:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.entity_type == @kind AND @model IN e.models
+  FILTER e.source_file != null
+  LET covered = COUNT(FOR r IN sysml_Relations
+                        FILTER r._to == e._id AND r.relationship_type == @relation
+                        AND r.stated == true
+                        RETURN 1)
+  FILTER covered == 0
+  RETURN {element: e.entity_name, at: CONCAT(e.source_file, ":", e.source_line)}
+```
+
+Leaving either filter off does not merely add noise -- it changes the answer, because
+an undeclared row can never be the subject of a stated relation and so lands in every
+"nothing satisfies it" result. If a question deliberately wants the prose layer too,
+say so in the answer.
 
 **Case.** Names are upper case, types are lower case. Compare a name the model
 supplies with `UPPER(@wanted)`, or use `CONTAINS(e.entity_name, UPPER(@wanted))`.
@@ -154,17 +183,57 @@ FOR e IN sysml_Entities
 Reaching one through the containment tree is better still when the question names
 a context ("the spacecraft at LOI"): start at the context and walk `owns`.
 
-An identifier like `DE-REQ-1`, `CLR-R083` or `FLR-R046` is a `short_name`, not an
-`entity_name`. The element is one row, stored under its written name, so look the
-identifier up in the field that holds it:
+**The same filter belongs on a population, not only on a lookup.** Counting,
+ranking and coverage questions -- *how many X*, *which X have no Y*, *the top ten X
+by Y* -- are answered over a set, and a set of elements means the declared ones. A
+row without a `source_file` is a name the extraction step read in prose and no
+declaration backs; it can never be the subject of a relation the file states, so it
+lands in every *"nothing satisfies it"* and *"has no owner"* answer and inflates it.
+Filter both sides:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.short_name == "DE-REQ-1"
+  FILTER e.entity_type == @kind AND @model IN e.models
+  FILTER e.source_file != null                      // a declared element
+  LET covered = COUNT(FOR r IN sysml_Relations
+                        FILTER r._to == e._id AND r.relationship_type == @relation
+                        AND r.stated == true        // a relation the file states
+                        RETURN 1)
+  FILTER covered == 0
+  RETURN {element: e.entity_name, at: CONCAT(e.source_file, ":", e.source_line)}
+```
+
+Dropping `stated` from the inner count answers a different and weaker question --
+"is there any evidence at all", including the LLM's reading -- so say which one was
+asked. Counting the same element twice is the other half of this: an element the
+prose names several ways can produce several unstated edges from what is really one
+source, so a count of *satisfiers* should be over `DISTINCT r._from`, not over rows.
+
+An identifier like `DE-REQ-1`, `CLR-R083` or `FLR-R046` is usually a `short_name`
+rather than an `entity_name`, so it has to be looked up in the field that holds it.
+But SysML lets the same identifier be *both*: a definition declared as
+`requirement def <'HLR-R001'> CrewReturnSafetyRequirement` carries it as a short
+name, while a usage of that definition can be declared as
+`requirement 'HLR-R001' : CrewReturnSafetyRequirement`, where it is the element's
+actual name. They are two elements, and the edges divide between them in a way that
+matters: the definition takes the `refines` from other requirements, and the usage
+is what `satisfy 'HLR-R001' by ...` names.
+
+So match both fields and return both rows, rather than taking `FIRST` of either:
+
+```aql
+FOR e IN sysml_Entities
+  FILTER e.short_name == UPPER(@id) OR e.entity_name == UPPER(@id)
   RETURN {name: e.entity_name, short: e.short_name, type: e.entity_type,
+          role: e.short_name == UPPER(@id) ? "declared with this identifier"
+                                           : "named by this identifier",
           description: e.description,
           at: CONCAT(e.source_file, ":", e.source_line)}
 ```
+
+`FIRST(...)` on an identifier is the trap: it silently picks one of the two and the
+answer looks complete. Walking outward from only that one is how a requirement with
+twenty relations comes back with one.
 
 **`attributes` is a map, not a list**, so `e.attributes[*].unit` does not iterate
 it. Reach a known attribute by name, and expand the map with `ATTRIBUTES()` when
@@ -172,7 +241,7 @@ the name is not known in advance:
 
 ```aql
 FOR e IN sysml_Entities
-  FILTER e.attributes != null
+  FILTER LENGTH(ATTRIBUTES(e.attributes)) > 0
   FOR name IN ATTRIBUTES(e.attributes)
     LET a = e.attributes[name]
     FILTER a.unit == "kg" AND a.value != null
@@ -214,11 +283,13 @@ contain" and "what does X specialize" are OUTBOUND. A question that asks for bot
 sides at once wants `ANY`, and `ANY` with `r._from == e._id` tells the two apart:
 
 ```aql
-LET e = FIRST(FOR x IN sysml_Entities FILTER x.short_name == @short RETURN x)
-FOR v, r IN 1..1 ANY e sysml_Relations
-  FILTER r.type == 'RELATED_TO'
-  RETURN {relation: r.relationship_type, other: v.entity_name,
-          direction: r._from == e._id ? 'outgoing' : 'incoming'}
+FOR e IN sysml_Entities
+  FILTER e.short_name == UPPER(@id) OR e.entity_name == UPPER(@id)
+  FOR v, r IN 1..1 ANY e sysml_Relations
+    FILTER r.type == 'RELATED_TO'
+    RETURN {of: e.entity_name, relation: r.relationship_type, other: v.entity_name,
+            direction: r._from == e._id ? 'outgoing' : 'incoming',
+            stated: r.stated == true}
 ```
 
 Picking one direction because the wording sounds one-way is the most common way to

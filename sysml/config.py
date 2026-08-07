@@ -14,6 +14,7 @@ hosted deployment.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -25,6 +26,10 @@ MODELS = ROOT / "models"
 OUT = ROOT / "out"
 KG = OUT / "kg"                  # GraphRAG's working_dir: extraction artifacts + LLM cache
 AQL_EXAMPLES = Path(__file__).resolve().parent / "aql_examples.md"
+# The same file written by `pipeline.examples` instead of by hand. It is a second
+# file rather than a replacement: the read side takes AQL_EXAMPLES unless it is
+# told otherwise, so generating one cannot change an answer by accident.
+AQL_EXAMPLES_GENERATED = Path(__file__).resolve().parent / "aql_examples_generated.md"
 
 # The four Arango repos this project reads, cloned next to it.
 IMPORTER_REPO = ROOT.parent / "graphrag_importer"
@@ -80,6 +85,12 @@ VECTOR_INDEX = IndexNames.VECTOR_COSINE
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIM = 1536
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o")
+
+# Only `pipeline.examples` uses this one, and it is deliberately not CHAT_MODEL.
+# Writing the examples file happens once per import and is the one call whose
+# output every later question depends on, so it is worth the strongest model
+# available; answering a question is a per-question cost and stays on CHAT_MODEL.
+EXAMPLES_MODEL = os.environ.get("EXAMPLES_MODEL", "gpt-5.5")
 
 SUB_COMMUNITY_OF = RelationshipTypes.SUB_COMMUNITY_OF
 EDGE_TYPES = tuple(sorted(RelationshipTypes.get_expected_types() | {SUB_COMMUNITY_OF}))
@@ -209,6 +220,15 @@ def openai_key() -> str:
     # reads OPENAI_API_KEY and nothing else.
     os.environ["OPENAI_API_KEY"] = key
     return key
+
+
+# Anything that writes. Two places run AQL that a language model wrote -- `nl`
+# runs what AQLizer generated for a question, and `pipeline.examples` runs the
+# worked examples out of a generated primer to check them -- and neither may be
+# allowed to reach the database with a mutation. The service's own read-only gate
+# is a substring test (`if op in query.upper()`), so it refuses "orbit INSERTion"
+# and passes a `FOR c IN [...] TRUNCATE c`. This is the one that decides.
+MUTATION = re.compile(r"\b(INSERT|UPDATE|REPLACE|REMOVE|UPSERT|TRUNCATE)\b", re.I)
 
 
 def client() -> ArangoClient:

@@ -6,7 +6,8 @@ collections, writes AQL, runs it and explains the rows. The only thing this proj
 gives it is `aql_examples`, read from `aql_examples.md` -- the argument
 `ReadOnlyArangoGraphQAChain.from_llm` has always accepted and the deployed service
 never passes. There are no hand-written query functions here: if an answer is wrong
-the fix goes in that file, not into Python.
+the fix goes in that file, not into Python. `instance(path)` primes it with a
+different file instead, which is how the generated one gets compared against it.
 
 `graphrag(question)` -- the GraphRAG retriever service from graphrag_retrievers,
 run in-process against the local database. `local` is hybrid vector + BM25 search
@@ -49,8 +50,9 @@ OPENAI_URL = "https://api.openai.com/v1"
 
 # The service's read-only check (WRITE_OPERATIONS) does not include TRUNCATE, so a
 # generated `FOR c IN [...] TRUNCATE c` passes it. Nothing reaches the database
-# without clearing this first.
-MUTATION = re.compile(r"\b(INSERT|UPDATE|REPLACE|REMOVE|UPSERT|TRUNCATE)\b", re.I)
+# without clearing this first. It lives in `config` because the generated-primer
+# step runs model-written AQL too, and one gate is easier to trust than two.
+MUTATION = config.MUTATION
 
 # Passed to the retriever as `response_instructions`, which is its supported way to
 # shape an answer.
@@ -194,13 +196,22 @@ class Answer:
 # ------------------------------------------------------------------- AQLizer
 
 
+_GRAPH = None
+
+
 class Aqlizer:
-    """The shipped Txt2AqlService, pointed at this database and given examples."""
+    """The shipped Txt2AqlService, pointed at this database and given examples.
+
+    `examples_path` is the one thing this project adds to the service, and it
+    defaults to the hand-written `aql_examples.md`. Pass another file to ask the
+    same questions primed with a different one -- `pipeline.examples` writes one
+    from the graph itself, and comparing the two is what `bespoke-aql-examples.ipynb`
+    does.
+    """
 
     def __init__(self, examples_path: Path | None = None):
         self.examples_path = examples_path or config.AQL_EXAMPLES
         self._service = None
-        self._graph = None
         self._bootstrap()
 
     def _bootstrap(self) -> None:
@@ -247,15 +258,21 @@ class Aqlizer:
         return self._service
 
     def graph(self):
-        """The LangChain ArangoGraph the service builds its schema picture from."""
-        if self._graph is None:
+        """The LangChain ArangoGraph the service builds its schema picture from.
+
+        Module-level rather than per-instance: two AQLizers differ only in which
+        examples file they were given, and the schema read is the slow part of
+        building either one.
+        """
+        global _GRAPH
+        if _GRAPH is None:
             from langchain_arangodb import ArangoGraph
             db = self.service.get_db_client().db(name=config.DB_NAME, user_token=token())
-            self._graph = ArangoGraph(db=db, generate_schema_on_init=True,
-                                      schema_sample_ratio=0, schema_graph_name=None,
-                                      schema_include_examples=True, schema_list_limit=32,
-                                      schema_string_limit=256)
-        return self._graph
+            _GRAPH = ArangoGraph(db=db, generate_schema_on_init=True,
+                                 schema_sample_ratio=0, schema_graph_name=None,
+                                 schema_include_examples=True, schema_list_limit=32,
+                                 schema_string_limit=256)
+        return _GRAPH
 
     @property
     def schema(self) -> dict:
@@ -509,15 +526,23 @@ def search_relations(db, question: str, k: int = 8, relation: str | None = None,
 
 # Both are expensive to build -- schema generation for one, index checks and a
 # database connection for the other -- and cheap to keep, so each is built once.
-_AQLIZER: Aqlizer | None = None
+# The AQLizers are kept per examples file, because comparing two of them means
+# holding both at once and the schema is the expensive half either way.
+_AQLIZERS: dict[Path | None, Aqlizer] = {}
 _RETRIEVER: Retriever | None = None
 
 
-def instance() -> Aqlizer:
-    global _AQLIZER
-    if _AQLIZER is None:
-        _AQLIZER = Aqlizer()
-    return _AQLIZER
+def instance(examples_path: Path | str | None = None) -> Aqlizer:
+    """The AQLizer, primed with `sysml/aql_examples.md` unless another file is named.
+
+    `pipeline.examples` writes a second examples file from the graph itself, and
+    `nl.instance(config.AQL_EXAMPLES_GENERATED)` is how that one gets asked the same
+    questions. The default is the hand-written file and does not change.
+    """
+    path = Path(examples_path) if examples_path is not None else None
+    if path not in _AQLIZERS:
+        _AQLIZERS[path] = Aqlizer(path)
+    return _AQLIZERS[path]
 
 
 def retriever() -> Retriever:
@@ -538,11 +563,13 @@ def main() -> None:
     ap.add_argument("--scope", default="local", choices=("local", "global", "unified"),
                     help="which retriever answers (--graphrag only)")
     ap.add_argument("--stock", action="store_true", help="AQLizer with no aql_examples")
+    ap.add_argument("--examples", type=Path, default=None,
+                    help=f"an examples file other than {config.AQL_EXAMPLES.name}")
     args = ap.parse_args()
     if args.graphrag:
         graphrag(args.question, args.scope).show()
     else:
-        instance().ask(args.question, primed=not args.stock).show()
+        instance(args.examples).ask(args.question, primed=not args.stock).show()
 
 
 if __name__ == "__main__":

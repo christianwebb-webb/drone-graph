@@ -3,11 +3,15 @@
 This is graphrag_importer's own extraction pipeline, run in-process. It reads the
 source text, asks an LLM for the entities and the relations between them, clusters
 the result with Leiden and writes one report per cluster. Nothing here parses
-SysML. The only thing this project tells it about SysML is the ontology in
-`config`: 27 entity types and 18 relation types, handed to `GraphRAG` as
-`entity_types` and `relationship_types` with `enable_strict_types=True`, which
-makes them a closed vocabulary rather than a suggestion -- an entity or edge whose
-type is not on the list is dropped, not renamed.
+SysML.
+
+Two things tell it what it is reading. The ontology in `config` -- 27 entity types
+and 18 relation types, handed over as `entity_types` and `relationship_types` with
+`enable_strict_types=True`, which makes them a closed vocabulary rather than a
+suggestion: an entity or edge whose type is not on the list is dropped, not
+renamed. And the prompts in `prompts`, which replace two of upstream's; the
+defaults are written for narrative prose and that module says what went wrong when
+they were pointed at a declaration.
 
 Provenance survives, which is the part worth knowing. `ainsert` takes a
 `metadata_list` alongside the texts and merges each dict into that document's
@@ -27,6 +31,7 @@ import logging
 import sys
 
 from .. import config
+from . import prompts
 
 # `print` is used by upstream's progress ticker, which is drawn with braille
 # characters. A Windows console is cp1252 by default and raises on them, mid-run,
@@ -49,7 +54,16 @@ def graphrag(model: str):
     before ArangoDB sees anything, so it is the only place it can be scoped.
 
     The LLM cache lives in the working directory, so a second run over unchanged
-    files re-reads the answers instead of re-buying them.
+    files re-reads the answers instead of re-buying them. It is keyed on the whole
+    prompt (`_llm.py:71`), so changing anything in `prompts` invalidates it and the
+    next run pays for the answers again.
+
+    `entity_extract_max_gleaning=0` switches off the second pass over each chunk.
+    It sends "MANY entities were missed in the last extraction ... look for
+    entities you may have overlooked, especially less common entity types" with no
+    way to answer that none were, which is a fair nudge on prose and an instruction
+    to invent on a file whose declarations were all found the first time. It is
+    also two thirds of the LLM calls: three per chunk become one.
     """
     config.openai_key()
     config.kg(model).mkdir(parents=True, exist_ok=True)
@@ -68,6 +82,8 @@ def graphrag(model: str):
         relationship_types=config.RELATIONS_ONTOLOGY,
         enable_strict_types=True,
         enable_chunk_embeddings=True,
+        custom_prompts=prompts.CUSTOM_PROMPTS,
+        entity_extract_max_gleaning=0,
     )
 
 

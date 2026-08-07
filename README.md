@@ -14,7 +14,7 @@ docker run -d --name christian-webb-drone-arango -p 8529:8529 \
   -e ARANGO_ROOT_PASSWORD=testpass arangodb:3.12.9.4 \
   arangod --experimental-vector-index=true
 
-python build.py                 # extract -> load -> analogy
+python build.py                 # extract -> load -> analogy -> examples
 ```
 
 The OpenAI key is read from `CHAT_API_KEY` (or `OPENAI_API_KEY`) in the `env` file
@@ -31,17 +31,19 @@ Four notebooks:
 - `analytics-demo.ipynb` -- the quantitative half: rollups, values, gaps, and the
   lexer run live on a SysML file it has never seen.
 - `analogy-demo.ipynb` -- relating the two models to each other.
+- `bespoke-aql-examples.ipynb` -- the hand-written AQLizer primer against one the
+  pipeline generates for itself, scored on ten questions with the answers computed
+  from the graph.
 
 You must have the 4 requisite Arango repos cloned adjacent to this one.
 
 ## Brainstorming Questions
 
-- Since we need to send aql_examples, could we instead have this be generated on each import as part of the pipeline, then use a stronger model with a template of what this should look like to build a relevant aql_examples for each new import?
 - Currently, we just import all models in models/. If this project ever becomes more than a POC, we should change this.
 
 ## The pipeline
 
-`build.py` runs three steps in order. Each one is also runnable on its own
+`build.py` runs four steps in order. Each one is also runnable on its own
 (`python -m sysml.pipeline.extract`) and reads only what the step before it left
 behind, so a rerun can start anywhere.
 
@@ -187,6 +189,28 @@ different models, using autograph's own `SimilarityFinder`.
 drone -- so nothing crosses a model boundary except where the two happen to use the
 same word, and "what plays the drone battery's role in Apollo?" has no path to walk.
 
+### 4. examples -- `sysml/pipeline/examples.py`
+
+Writes `sysml/aql_examples_generated.md`, the primer AQLizer is given, from the
+finished graph -- a fixed prompt holding what is true of any graph this pipeline
+builds, plus a survey of this one: which entity types occur, which attribute names
+exist and in what units, real short names, real snapshot names, which relations were
+read and which inferred. A strong model (`EXAMPLES_MODEL`, default `gpt-5.5`) turns
+the two into the file. Every ```aql block in what comes back is then parsed and run,
+and anything that fails goes back with its error for a repair round; a query that
+writes is refused rather than run.
+
+**Why:** `sysml/aql_examples.md` is hand-written, and every paragraph of it was
+learned by asking a question and working out why the answer was wrong. A corpus
+imported next week gets none of that. This step is the same primer for the price of
+a build.
+
+It is a second file, not a replacement. `nl.instance()` still takes the hand-written
+one; `nl.instance(config.AQL_EXAMPLES_GENERATED)` takes this one, and
+`bespoke-aql-examples.ipynb` scores them against each other. `--no-examples` skips
+the step.
+
+
 ## Asking questions
 
 `sysml/nl.py` is the read side, and it offers two paths:
@@ -194,7 +218,8 @@ same word, and "what plays the drone battery's role in Apollo?" has no path to w
 - **AQLizer** -- Arango's natural-language-to-AQL service, given one extra thing:
   `sysml/aql_examples.md`, which teaches it how SysML concepts are laid out in this
   graph. Best at analytical questions ("which requirements does nothing satisfy?").
-  Every answer comes back with the AQL that produced it.
+  Every answer comes back with the AQL that produced it. `nl.instance(path)` primes
+  it with a different file instead -- step 4 writes one.
 - **GraphRAG** -- the retriever service, run against this graph. `local` does hybrid
   vector + BM25 search over the entities, fuses the two rankings, and expands over
   the relations it lands on; `global` answers from the community reports; `unified`
