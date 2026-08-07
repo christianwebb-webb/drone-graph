@@ -79,10 +79,13 @@ def importer(model: str):
         # models that use the same word from becoming one row.
         import_number=config.import_number(model),
         project_name=config.PROJECT,
-        # Communities are embedded so `global` can search them, and edges so a
-        # question can be matched against the relations themselves.
+        # Communities are embedded so `global` can search them. Edges are not, and
+        # the importer's default is already off: it would embed them before
+        # `structure` runs, which is both too early and too narrow. `structure`
+        # does it instead, at the end, once the edges that survive are known --
+        # see `structure.embed_relations`.
         embedding_func=openai_embedding,
-        enable_edge_embeddings=True,
+        enable_edge_embeddings=False,
         enable_community_embeddings=True,
     )
 
@@ -129,9 +132,9 @@ async def load() -> dict:
 
     # Not the edge collection. ArangoDB requires the indexed vector field on every
     # document in the collection, and only RELATED_TO edges carry one -- the
-    # structural edges have no text to embed. Exact COSINE_SIMILARITY is used for
-    # those instead, which is also the only form that can be filtered by
-    # relationship_type in the same query.
+    # community, chunk and analogy edges have no text of their own. Exact
+    # COSINE_SIMILARITY is used for those instead, which is also the only form
+    # that can be filtered by relationship_type in the same query.
     for name in (config.ENTITIES, config.CHUNKS, config.COMMUNITIES):
         await imp.create_vector_index(collection_name=name,
                                       field=config.EMBEDDING_FIELD,
@@ -139,7 +142,8 @@ async def load() -> dict:
     return {**{name: db.collection(name).count() for name in config.ALL_COLLECTIONS},
             "stated relations": counts["edges"],
             "entities created by structure": counts["created"],
-            "short-name duplicates merged": counts["merged"]}
+            "short-name duplicates merged": counts["merged"],
+            "relations given a vector": counts["embedded"]}
 
 
 def chunk_vectors(db, imp) -> int:

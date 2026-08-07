@@ -719,6 +719,45 @@ def key_of(entity_name: str, import_number: int) -> str:
     return f"{farmhash.Fingerprint64(entity_name)}_{import_number}"
 
 
+def embed_relations(db) -> int:
+    """Give every surviving relation a vector, once the deletions are done.
+
+    `nl.RELATION_SEARCH` matches a question against the relations themselves --
+    exact cosine, filterable by `relationship_type`, which is the whole reason it
+    is not an index scan. It needs a vector on the edge to do that.
+
+    The importer can write these during the import, and `enable_edge_embeddings`
+    is off because doing it there is wrong twice over. It runs before this step,
+    so it pays for the inferred containment and the duplicates that are about to
+    be deleted -- roughly three quarters of what it embeds. And it only ever sees
+    extraction's edges, so the relations the lexer read, which are the exact ones
+    worth searching, never get a vector at all. Doing it here covers all of them
+    and only the survivors.
+    """
+    rows = list(db.aql.execute(f"""
+        FOR r IN {config.RELATIONS}
+          FILTER r.type == "RELATED_TO" AND !IS_LIST(r.{config.EMBEDDING_FIELD})
+          FILTER r.description != null AND r.description != ""
+          RETURN {{_key: r._key, description: r.description}}"""))
+    if not rows:
+        return 0
+
+    vectors = embed([row["description"] for row in rows])
+    updates = [{"key": row["_key"], "vector": vector}
+               for row, vector in zip(rows, vectors)]
+
+    # AQL rather than `import_bulk`: this is an edge collection, and a bulk write
+    # into one is validated as an insert even when it would only update, so it is
+    # rejected for not carrying `_from` and `_to`.
+    for i in range(0, len(updates), 500):
+        db.aql.execute(
+            f"""FOR u IN @updates
+                  UPDATE u.key WITH {{{config.EMBEDDING_FIELD}: u.vector}}
+                  IN {config.RELATIONS}""",
+            bind_vars={"updates": updates[i:i + 500]})
+    return len(updates)
+
+
 def apply(db, structure: dict | None = None, create_missing: bool = True) -> dict[str, int]:
     """Write the attributes and the stated relations onto the extracted graph.
 
@@ -891,9 +930,14 @@ def apply(db, structure: dict | None = None, create_missing: bool = True) -> dic
               REMOVE r IN {config.RELATIONS}
               COLLECT WITH COUNT INTO n RETURN n""")
 
+    # Last, so that nothing is embedded that the three passes above are about to
+    # delete, and so the stated edges written earlier in this function are included.
+    embedded = embed_relations(db)
+
     return {"elements": len(structure["elements"]), "created": len(created),
             "with_attributes": sum(1 for e in structure["elements"] if e.get("attributes")),
             "merged": merged, "edges": len(rows), "dropped": dropped,
+            "embedded": embedded,
             "superseded": (next(iter(superseded), 0) + next(iter(reflexive), 0)
                            + next(iter(inverted), 0))}
 
@@ -910,6 +954,7 @@ def main(create_missing: bool = True) -> None:
     print(f"  {counts['edges']:>6}  stated relations written")
     print(f"  {counts['superseded']:>6}  LLM edges dropped (stated twin, or reflexive)")
     print(f"  {counts['dropped']:>6}  relations dropped (an end is outside the models)")
+    print(f"  {counts['embedded']:>6}  surviving relations given a vector")
 
 
 if __name__ == "__main__":

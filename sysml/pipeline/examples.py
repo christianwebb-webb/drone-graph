@@ -86,8 +86,15 @@ extraction's.
 
 ## The invariants a query here has to respect
 
-- `entity_name` is UPPER CASE. A comparison against a mixed-case literal matches
-  nothing. Compare with `UPPER(@x)` or use `CONTAINS(e.entity_name, UPPER(@x))`.
+- `entity_name` is UPPER CASE, and a declared element's name is whatever the
+  declaration wrote. An unquoted SysML identifier cannot contain a space, so a
+  two-word thing is declared as one word and stored as one word -- and the two words
+  a question uses for it will not match under `UPPER` alone. A quoted name can
+  contain spaces, and is stored with them. So a name from a question has to be tried
+  both ways: `UPPER(SUBSTITUTE(@name, " ", ""))` for the identifier case and
+  `UPPER(@name)` for the quoted case. Neither form finds the other, so a lookup that
+  tries only one is half a lookup. The survey below shows which of the two shapes
+  this graph actually holds.
 - `entity_type` is a single lower-case string from a closed list of 27:
   {", ".join(config.ENTITY_TYPES)}.
   There is no `component`, `system`, `element`, `function` or `module` type. A noun
@@ -120,10 +127,10 @@ extraction's.
   path and over six hops reaches most of the graph. Filter the path instead:
   `FILTER p.edges[*].relationship_type ALL IN [...]`.
 - A containment rollup follows `owns` AND `typedby` together and nothing else. A
-  part *usage* carries no values -- `part stage1 : 'S-IC'` is an occurrence of a
-  definition, and the numbers are declared on the definition. Letting `specializes`
-  into the walk climbs to an abstract supertype and back down into everything else
-  that specializes it, which is a different vehicle's parts.
+  part *usage* carries no values -- `part someUsage : SomeDefinition` is an
+  occurrence of a definition, and the numbers are declared on the definition.
+  Letting `specializes` into the walk climbs to an abstract supertype and back down
+  into everything else that specializes it, which is a different subtree entirely.
 - Time-varying values live on `snapshot` and `timeslice` elements, which redeclare
   the parts they are about with the values held at that moment. A question about a
   moment starts at the occurrence and walks down; reading the static part answers a
@@ -152,9 +159,15 @@ A markdown file, and nothing else -- no preamble, no sign-off, no outer code fen
   identifier, the moment -- write a bind parameter (`UPPER(@name)`), not a literal:
   the reader copies the shape of an example, so an example that matches one long name
   exactly teaches it to guess long names. Reserve literals for what is fixed about the
-  graph: a model name, an entity type, an attribute name. And show how a name from a
-  question is resolved -- exact match, then the owner-prefixed form, then containment
-  -- rather than assuming the wording matches a stored name.
+  graph: a model name, an entity type, an attribute name.
+- Any example that starts from a name the question supplied has to resolve it all
+  the way down, in one query, each rung guarded on the ones above finding nothing:
+  the closed-up upper-case form, then the plain upper-case form, then the
+  owner-prefixed suffix, then `CONTAINS`. Stopping early is the most expensive
+  mistake this file can teach, because the query still runs, still returns cleanly,
+  and returns nothing -- which reads as "the model does not contain that" rather
+  than "the name was never found". Devote one worked block to that resolution and
+  nothing else, so its shape can be copied rather than reconstructed.
 - Every query must be READ-ONLY. The reader answers questions; it never writes.
   No `INSERT`, `UPDATE`, `REPLACE`, `REMOVE`, `UPSERT` or `TRUNCATE` anywhere in
   the file, not even in an example of what not to do.
